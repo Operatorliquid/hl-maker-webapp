@@ -1,236 +1,293 @@
 # backend/api/bot_manager.py
 from __future__ import annotations
-import os, sys, signal, threading, multiprocessing as mp
-from dataclasses import dataclass
-from typing import Optional, Dict, Deque, Any
-from collections import deque
-import logging
+import os
 import time
+import signal
+import logging
+import threading
+import multiprocessing as mp
+from dataclasses import dataclass, asdict
+from typing import Optional, Dict, Deque, Any, List
+from collections import deque
 
 from api import pidguard
 
-# ---- tipos hints (opcionales) ----
-try:
-    from src.maker_bot import BotArgs  # type: ignore
-    from src.adapter import HLConfig   # type: ignore
-except Exception:
-    from dataclasses import dataclass
-    @dataclass
-    class BotArgs:  # type: ignore
-        ticker: str
-        amount_per_level: float
-        min_spread: float
-        maker_only: bool
-        ttl: float
-        use_testnet: bool
-        use_agent: bool
-        agent_private_key: Optional[str]
-    @dataclass
-    class HLConfig:  # type: ignore
-        private_key: str
-        use_testnet: bool = False
-        use_agent: bool = False
-        agent_private_key: Optional[str] = None
+# ===== Multiprocessing: usar SIEMPRE SPAWN (macOS/Railway) =====
+CTX = mp.get_context("spawn")
 
+# ===== Logger =====
 log = logging.getLogger("bot_manager")
+log.setLevel(logging.INFO)
 
-# ======================================================================
-# Proceso hijo: corre el bot y reenvía logs a la queue
-# ======================================================================
-def _worker(log_q: mp.Queue, cfg_dict: Dict[str, Any], args_dict: Dict[str, Any]):
-    # logging simple → queue
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    class _QH(logging.Handler):
-        def emit(self, record):
-            try:
-                msg = self.format(record)
-            except Exception:
-                msg = str(record.getMessage())
-            try:
-                log_q.put_nowait(msg)
-            except Exception:
-                pass
-    qh = _QH()
-    qh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    root.handlers[:] = [qh]
+# ===== Config watchdog (opcional) =====
+STOP_ON_SILENCE_SEC = int(os.getenv("STOP_ON_SILENCE_SEC", "0") or "0")
 
-    # Señales → salida limpia
-    def _sig_handler(*_a):
-        try: log_q.put_nowait("[STOP] Señal recibida, cerrando bot…")
-        except Exception: pass
-        os._exit(0)
-    signal.signal(signal.SIGTERM, _sig_handler)
-    signal.signal(signal.SIGINT, _sig_handler)
 
-    # WATCH del padre: si muere el backend, el hijo sale
-    parent_pid0 = os.getppid()
-    def _parent_watch():
-        while True:
-            time.sleep(1.5)
-            ppid = os.getppid()
-            if ppid == 1 or ppid != parent_pid0:
-                try: log_q.put_nowait("[STOP] Parent murió / cambió, saliendo…")
-                except Exception: pass
-                os._exit(0)
-    threading.Thread(target=_parent_watch, daemon=True).start()
-
-    # Imports pesados SOLO en el hijo
-    from src.adapter import ExchangeAdapter, HLConfig as _HLConfig  # type: ignore
-    from src.maker_bot import MakerBot, BotArgs as _BotArgs        # type: ignore
-
-    cfg = _HLConfig(**cfg_dict)
-    args = _BotArgs(**args_dict)
-
-    root.info(f"[MANAGER] spawn bot for {args.ticker} testnet={args.use_testnet} agent={bool(args.agent_private_key)}")
-
-    adapter = ExchangeAdapter(cfg)
-    bot = MakerBot(adapter, args)
-
+# ------------------------------
+# Worker: corre el MakerBot real
+# ------------------------------
+def _worker(key: str,
+            cfg_dict: Dict[str, Any],
+            args_dict: Dict[str, Any],
+            log_q: mp.Queue,
+            stop_evt: mp.Event) -> None:
+    """
+    Proceso hijo: reconstruye HLConfig/BotArgs, crea ExchangeAdapter + MakerBot y corre el loop.
+    Reenvía todos los logs al padre vía QueueHandler.
+    """
     try:
+        # --- logging del hijo: mandar TODO al queue del padre
+        import logging
+        from logging.handlers import QueueHandler
+
+        root = logging.getLogger()
+        # limpiar handlers previos (si hubiera)
+        while root.handlers:
+            try:
+                root.removeHandler(root.handlers[0])
+            except Exception:
+                break
+        qh = QueueHandler(log_q)
+        qh.setLevel(logging.INFO)
+        root.addHandler(qh)
+        root.setLevel(logging.INFO)
+
+        # Log de arranque
+        logging.info(f"[CHILD] starting worker key={key}")
+
+        # Importes dentro del hijo (import lazy para SPAWN)
+        from src.adapter import HLConfig, ExchangeAdapter
+        from src.maker_bot import BotArgs, MakerBot
+
+        # Re-armar dataclasses
+        cfg = HLConfig(**cfg_dict)
+        args = BotArgs(**args_dict)
+
+        # Construir adapter + bot
+        adapter = ExchangeAdapter(cfg)
+        bot = MakerBot(adapter, args)
+
+        # Secuencia de ejecución (como en tu maker_bot)
         bot.resolve_coin()
         bot.start_ws()
-        bot.loop()   # el loop debería salir por SIGTERM o por su propia condición
-    except KeyboardInterrupt:
-        root.info("[MANAGER] KeyboardInterrupt en worker")
+        bot.loop()  # bloqueante hasta que termine
+
+        logging.info("[CHILD] worker finished normally")
+
     except Exception as e:
-        root.exception(f"[MANAGER] Excepción en worker: {e}")
-        time.sleep(0.1)
-    finally:
-        try: log_q.put_nowait("[MANAGER] worker terminado")
-        except Exception: pass
+        try:
+            logging.exception(f"[CHILD] worker crashed: {e}")
+        finally:
+            # En caso de error, salimos con código distinto de cero
+            os._exit(1)
 
-# ======================================================================
-# Estado
-# ======================================================================
-@dataclass
-class RunnerState:
-    proc: Optional[mp.Process] = None
-    started_at: float = 0.0
 
+# --------------------------------
+# Listener de logs en el proceso padre
+# --------------------------------
+def _log_listener(q: mp.Queue, buffer: Deque[str], stop_evt: threading.Event):
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    while not stop_evt.is_set():
+        try:
+            rec = q.get(timeout=0.5)
+        except Exception:
+            continue
+        try:
+            # Si el hijo mandó un LogRecord, lo formateamos
+            line = fmt.format(rec)
+        except Exception:
+            # Si es texto crudo, lo casteamos
+            line = str(rec)
+        buffer.append(line)
+
+
+# ------------------------------
+# Runner: estado por usuario/bot
+# ------------------------------
 class BotRunner:
     def __init__(self, key: str):
         self.key = key
-        self.state = RunnerState()
-        self._log_q: mp.Queue = mp.Queue(maxsize=5000)
-        self._logs: Deque[str] = deque(maxlen=8000)
-        self._drainer: Optional[threading.Thread] = None
+        self.proc: Optional[mp.Process] = None
+        self.log_q: mp.Queue = CTX.Queue()
+        self._log_buf: Deque[str] = deque(maxlen=2000)
+        self._log_thread: Optional[threading.Thread] = None
+        self._log_thread_stop = threading.Event()
+        self._lock = threading.Lock()
+        self.stop_evt: mp.Event = CTX.Event()
+        self.started_at: Optional[float] = None
+        self.last_beat: float = time.time()
 
-    def _start_drainer(self):
-        if self._drainer and self._drainer.is_alive():
-            return
-        def _drain():
-            while True:
-                try:
-                    line = self._log_q.get()
-                except Exception:
-                    break
-                if line is None:
-                    break
-                self._logs.append(str(line))
-                p = self.state.proc
-                if (p is None) or (not p.is_alive()):
-                    if self._log_q.empty():
-                        break
-        self._drainer = threading.Thread(target=_drain, daemon=True)
-        self._drainer.start()
+    # --- control de logs ---
+    def _start_log_listener(self):
+        self._log_thread_stop.clear()
+        t = threading.Thread(target=_log_listener, args=(self.log_q, self._log_buf, self._log_thread_stop), daemon=True)
+        t.start()
+        self._log_thread = t
 
-    def read_logs(self, n: int = 200):
-        if n <= 0:
-            return []
-        return list(self._logs)[-n:]
-
-    def start(self, cfg: HLConfig, args: BotArgs):
-        # no dupliques
-        if self.state.proc and self.state.proc.is_alive():
-            return
-
-        # limpia restos (por si quedó algo)
-        pidguard.kill_key(self.key)
-
-        # serializables
-        cfg_d = {
-            "private_key": cfg.private_key,
-            "use_testnet": bool(cfg.use_testnet),
-            "use_agent": bool(getattr(cfg, 'use_agent', False)),
-            "agent_private_key": getattr(cfg, 'agent_private_key', None),
-        }
-        args_d = {
-            "ticker": args.ticker,
-            "amount_per_level": float(args.amount_per_level),
-            "min_spread": float(args.min_spread),
-            "maker_only": bool(args.maker_only),
-            "ttl": float(args.ttl),
-            "use_testnet": bool(args.use_testnet),
-            "use_agent": bool(args.use_agent),
-            "agent_private_key": getattr(args, 'agent_private_key', None),
-        }
-
-        proc = mp.get_context("spawn").Process(
-            target=_worker, args=(self._log_q, cfg_d, args_d), name=f"hlbot-{self.key}"
-        )
-        proc.daemon = True
-        proc.start()
-        self.state = RunnerState(proc=proc, started_at=time.time())
-
-        pidguard.write_pidfile(self.key, proc.pid)
-        self._start_drainer()
-
-        threading.Thread(target=self._watch_and_cleanup, args=(proc,), daemon=True).start()
-
-    def _watch_and_cleanup(self, proc: mp.Process):
-        proc.join()
+    def _stop_log_listener(self):
         try:
-            pidguard.remove_pidfile(self.key)
-        finally:
-            try: self._log_q.put_nowait(None)
-            except Exception: pass
+            self._log_thread_stop.set()
+        except Exception:
+            pass
 
-    def stop(self):
-        p = self.state.proc
-        if p and p.is_alive():
+    def read_logs(self, max_lines: int = 200) -> List[str]:
+        """Devuelve y DRENA hasta max_lines del buffer."""
+        lines: List[str] = []
+        with self._lock:
+            for _ in range(min(max_lines, len(self._log_buf))):
+                try:
+                    lines.append(self._log_buf.popleft())
+                except IndexError:
+                    break
+        return lines
+
+    # --- lifecycle ---
+    def start(self, cfg, args):
+        from dataclasses import asdict
+        if self.proc and self.proc.is_alive():
+            log.info(f"[RUNNER] {self.key} ya estaba vivo, lo paro antes de reiniciar")
+            self.stop()
+
+        cfg_d = asdict(cfg)
+        args_d = asdict(args)
+
+        self.stop_evt = CTX.Event()
+        self.proc = CTX.Process(
+            target=_worker,
+            args=(self.key, cfg_d, args_d, self.log_q, self.stop_evt),
+            name=f"hlbot-{self.key}",
+            daemon=True,  # si muere uvicorn, muere el hijo
+        )
+        self.proc.start()
+        self.started_at = time.time()
+        self.last_beat = self.started_at
+
+        # Log listener
+        self._start_log_listener()
+
+        # PID file para matar por fuera si hiciera falta
+        try:
+            pidguard.write_pidfile(self.key, self.proc.pid)
+        except Exception as e:
+            log.warning(f"[RUNNER] write_pidfile error: {e}")
+
+        log.info(f"[RUNNER] started key={self.key} pid={self.proc.pid}")
+
+    def stop(self, timeout: float = 3.0):
+        p = self.proc
+        if not p:
+            return
+        try:
+            log.info(f"[RUNNER] stopping key={self.key} pid={getattr(p,'pid',None)}")
+            # Señal suave al hijo (si la usás dentro de maker_bot)
             try:
-                os.kill(p.pid, signal.SIGTERM)
-                p.join(timeout=3.0)
+                self.stop_evt.set()
             except Exception:
                 pass
+
+            # Espera suave
+            p.join(timeout)
+            # SIGTERM si sigue vivo
+            if p.is_alive():
+                try:
+                    os.kill(p.pid, signal.SIGTERM)
+                except Exception:
+                    pass
+                p.join(1.5)
+            # SIGKILL si aún sigue
             if p.is_alive():
                 try:
                     os.kill(p.pid, signal.SIGKILL)
-                    p.join(timeout=2.0)
                 except Exception:
                     pass
-        pidguard.kill_key(self.key)
-        self.state = RunnerState(proc=None, started_at=0.0)
-        try: self._log_q.put_nowait(None)
-        except Exception: pass
+                p.join(0.5)
+        finally:
+            # Listener y pidfile
+            self._stop_log_listener()
+            try:
+                pidguard.kill_key(self.key)
+            except Exception:
+                pass
+            self.proc = None
 
-    def get_adapter(self):
-        return None
+    def is_alive(self) -> bool:
+        return bool(self.proc and self.proc.is_alive())
 
-# ======================================================================
-# Registro
-# ======================================================================
-class BotRegistry:
+    def touch(self):
+        self.last_beat = time.time()
+
+
+# ------------------------------
+# Registry (multiusuario)
+# ------------------------------
+class Registry:
     def __init__(self):
-        self._by_key: Dict[str, BotRunner] = {}
+        self._runners: Dict[str, BotRunner] = {}
         self._lock = threading.Lock()
+        self._stop_on_silence = STOP_ON_SILENCE_SEC
+        # Watchdog de inactividad (si configurado)
+        if self._stop_on_silence > 0:
+            threading.Thread(target=self._watchdog, daemon=True).start()
 
-    def get(self, key: str) -> Optional[BotRunner]:
-        return self._by_key.get(key)
+    def _watchdog(self):
+        while True:
+            try:
+                if self._stop_on_silence > 0:
+                    now = time.time()
+                    with self._lock:
+                        for key, r in list(self._runners.items()):
+                            if r.is_alive():
+                                idle = now - r.last_beat
+                                if idle > self._stop_on_silence:
+                                    log.info(f"[WD] stopping {key} por inactividad ({int(idle)}s)")
+                                    try:
+                                        r.stop()
+                                    finally:
+                                        try:
+                                            pidguard.kill_key(key)
+                                        except Exception:
+                                            pass
+            except Exception:
+                pass
+            time.sleep(5)
 
-    def start(self, key: str, cfg: HLConfig, args: BotArgs):
+    # API pública usada por main.py
+    def start(self, key: str, cfg, args):
         with self._lock:
-            br = self._by_key.get(key)
-            if not br:
-                br = BotRunner(key)
-                self._by_key[key] = br
-            br.start(cfg, args)
+            r = self._runners.get(key)
+            if not r:
+                r = BotRunner(key)
+                self._runners[key] = r
+        r.start(cfg, args)
+        return True
 
     def stop(self, key: str):
         with self._lock:
-            br = self._by_key.get(key)
-            if br:
-                br.stop()
+            r = self._runners.get(key)
+        if r:
+            r.stop()
+            return True
+        return False
 
-registry = BotRegistry()
+    def get(self, key: str) -> Optional[BotRunner]:
+        with self._lock:
+            return self._runners.get(key)
+
+    def touch(self, key: str):
+        with self._lock:
+            r = self._runners.get(key)
+        if r:
+            r.touch()
+
+    # util global
+    def stop_all(self) -> Dict[str, bool]:
+        out = {}
+        with self._lock:
+            keys = list(self._runners.keys())
+        for k in keys:
+            out[k] = self.stop(k)
+        return out
+
+
+# Export singleton
+registry = Registry()
