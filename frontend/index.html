@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>OperatorLiquid</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="bg-blobs">
+    <img src="./assets/elipse.png" alt="" class="blob blob-1" />
+    <img src="./assets/elipse.png" alt="" class="blob blob-2" />
+  </div>
+
+  <header class="topbar">
+    <div class="brand">
+      <img src="./assets/logo.png" alt="OperatorLiquid" />
+    </div>
+
+    <!-- ÚNICO botón de wallet (ícono + label) -->
+    <div class="wallet">
+      <button class="btn btn-primary" id="btnConnect">
+        <img id="mmIcon" src="assets/MetaMask-icon-fox.svg" alt="MetaMask" class="mm-icon hidden" />
+        <span id="walletLabel">Connect Wallet</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="glass">
+      <div class="glass__inner">
+        <div class="cfg">
+          <h2>Configure BOT</h2>
+
+          <div class="grid">
+            <label>
+              <span>Ticket</span>
+              <input id="ticker" class="field" list="tickers" placeholder="Escribe p.ej. PUP/USDC" />
+              <datalist id="tickers"></datalist>
+            </label>
+
+            <label>
+              <span>Amount por order (USDC)</span>
+              <input id="amount" class="field" type="number" min="0" step="0.01" value="12" />
+            </label>
+
+            <label>
+              <span>TTL (Seconds)</span>
+              <input id="ttl" class="field" type="number" min="0" step="1" value="20" />
+            </label>
+
+            <label>
+              <span>Min spread (%)</span>
+              <input id="minSpread" class="field" type="number" min="0" step="0.001" value="0.006" />
+              <small class="hint">Default: 0.006</small>
+            </label>
+
+            <label class="check">
+              <input id="makerOnly" type="checkbox" checked />
+              <span>Market Only</span>
+            </label>
+
+            <label class="check">
+              <input id="testnet" type="checkbox" />
+              <span>Testnet</span>
+            </label>
+          </div>
+
+          <div class="actions">
+            <button id="btnStart" class="btn btn-primary">Start bot 🚀</button>
+            <button id="btnStop" class="btn">Stop bot</button>
+          </div>
+
+          <p class="note">*Orders are set to Market Only so that those that are far from the current price can be canceled.<br>Refreshing or closing the tab will not stop the bot.</p>
+
+          <div class="status">
+            <span class="dot" id="statusDot"></span>
+            <span id="statusText">Stopped</span>
+          </div>
+        </div>
+
+        <aside class="logs">
+          <div class="logs__head">
+            <h3>LOGS</h3>
+            <div class="logs__actions">
+              <button id="btnConnectWS" class="btn tiny">Conectar</button>
+              <button id="btnDisconnectWS" class="btn tiny">Cortar</button>
+              <span id="wsState" class="tag">desconectado</span>
+            </div>
+          </div>
+          <pre id="logBox" class="logs__box"></pre>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <small>Backend: <code id="backendUrl"></code></small>
+  </footer>
+
+  <!-- Side panel (queda igual) -->
+  <div id="sideBackdrop" class="backdrop"></div>
+  <aside id="sidePanel" class="side">
+    <div class="side-header">
+      <div class="side-title">
+        <img src="assets/MetaMask-icon-fox.svg" class="mm-icon" alt="">
+        <span id="panelWallet">0x…</span>
+      </div>
+      <button id="sideClose" class="icon-btn" type="button" aria-label="Close">×</button>
+    </div>
+    <div class="side-body">
+      <div class="kv">
+        <div class="k">ESTATUS</div>
+        <div class="v"><span id="panelStatus">Stopped</span></div>
+      </div>
+      <div class="mt">
+        <button id="panelDisconnect" class="btn danger">Disconnect wallet</button>
+      </div>
+    </div>
+  </aside>
+
+  <script src="./app.js"></script>
+</body>
+</html>

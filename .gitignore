@@ -1,0 +1,10 @@
+# python / backend
+backend/.venv/
+backend/__pycache__/
+**/__pycache__/
+backend/.env
+*.pyc
+
+# front (por si a futuro usás bundlers)
+node_modules/
+dist/
