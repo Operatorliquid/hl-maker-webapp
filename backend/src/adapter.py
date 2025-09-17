@@ -24,10 +24,15 @@ SPOT_MIN_NOTIONAL = 10.0  # ~10 USDC mínimo en spot (según docs)
 # ----------------- Config HL -----------------
 @dataclass
 class HLConfig:
-    private_key: str
+    # AHORA opcional: si vas a usar agente, podés dejarlo en None
+    private_key: Optional[str] = None
     use_testnet: bool = False
+
+    # agente (si viene, usamos agente). En modo agente SIN private_key,
+    # tenés que pasar owner_address (la wallet del usuario que aprobó el agente).
     use_agent: bool = False
     agent_private_key: Optional[str] = None
+    owner_address: Optional[str] = None  # <- NUEVO: dueño que aprobó al agente
 
 
 class ExchangeAdapter:
@@ -37,19 +42,45 @@ class ExchangeAdapter:
     - resuelve el 'coin' spot
     - helpers de balances / place_limit / cancel
     - AJUSTE de lot/tick size según spot_meta
+
+    Modos de operación:
+      • Owner (sin agente): requiere private_key
+      • Agent: requiere agent_private_key y:
+          - o bien private_key (del owner) para derivar owner_address
+          - o bien owner_address explícito (recomendado para multiusuario)
     """
     def __init__(self, cfg: HLConfig):
         self.cfg = cfg
         self.base_url = constants.TESTNET_API_URL if cfg.use_testnet else constants.MAINNET_API_URL
 
+        # --- MODO AGENTE ---
         if cfg.use_agent and cfg.agent_private_key:
-            main_acct = Account.from_key(cfg.private_key)
             agent_acct = Account.from_key(cfg.agent_private_key)
+
+            # Determinar owner_address:
+            if cfg.private_key:
+                # Si te pasaron private_key del owner, la usamos solo para derivar el address
+                main_acct = Account.from_key(cfg.private_key)
+                owner_addr = main_acct.address
+            else:
+                # Multiusuario: el backend debe proveer el address del usuario que aprobó al agente
+                if not cfg.owner_address:
+                    raise ValueError(
+                        "Agent mode: falta owner_address. "
+                        "Pasá HLConfig(owner_address=<wallet_del_usuario>) cuando uses agente sin private_key."
+                    )
+                owner_addr = cfg.owner_address
+
             self.info = Info(self.base_url, skip_ws=True)
-            self.exchange = Exchange(agent_acct, self.base_url, account_address=main_acct.address)
-            self.address = main_acct.address
-            log.info(f"[HL] agent mode principal={main_acct.address} agent={agent_acct.address}")
+            # Firmamos con el agente, pero operamos a nombre del 'owner_addr'
+            self.exchange = Exchange(agent_acct, self.base_url, account_address=owner_addr)
+            self.address = owner_addr
+            log.info(f"[HL] agent mode owner={owner_addr} agent={agent_acct.address}")
+
+        # --- MODO OWNER (sin agente) ---
         else:
+            if not cfg.private_key:
+                raise ValueError("Owner mode: falta private_key (o activá use_agent con agent_private_key).")
             acct = Account.from_key(cfg.private_key)
             self.info = Info(self.base_url, skip_ws=True)
             self.exchange = Exchange(acct, self.base_url)

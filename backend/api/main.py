@@ -72,11 +72,11 @@ NONCES: Dict[str, str] = {}     # address_lower -> nonce
 SESSIONS: Dict[str, dict] = {}  # token -> {address, created_at}
 
 # ---- helpers
-def _require_server_key() -> str:
+from typing import Optional
+
+def _get_server_key() -> Optional[str]:
     priv = (os.getenv("HL_PRIVATE_KEY") or "").strip()
-    if not priv:
-        raise HTTPException(status_code=400, detail="Falta HL_PRIVATE_KEY en server")
-    return priv
+    return priv or None
 
 def _reg_key_from_auth(authorization: str) -> str:
     """
@@ -93,10 +93,19 @@ def _reg_key_from_auth(authorization: str) -> str:
     return "owner"
 
 def _build_cfg(req: StartReq) -> HLConfig:
-    # si vino agent_private_key en el body, usamos agente; no lo persistimos.
+    # si vino agent_private_key y use_agent = true, usamos agente
     agent_key = (req.agent_private_key or "").strip() if req.use_agent else ""
+    server_key = _get_server_key()
+
+    # validación: tiene que venir al menos una clave (agente o server)
+    if not agent_key and not server_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Falta clave: enviá agent_private_key (use_agent=true) o definí HL_PRIVATE_KEY en el server."
+        )
+
     return HLConfig(
-        private_key=_require_server_key(),
+        private_key=server_key,             # puede ser None si usamos agente
         use_testnet=req.testnet,
         use_agent=bool(agent_key),
         agent_private_key=agent_key or None,
