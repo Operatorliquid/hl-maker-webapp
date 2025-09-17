@@ -253,18 +253,25 @@ def stop_all():
 def status(authorization: str = Header(default="")):
     key = _reg_key_from_auth(authorization)
     br = registry.get(key)
-    p = getattr(getattr(br, "state", None), "proc", None) if br else None
+    # ANTES: p = getattr(getattr(br, "state", None), "proc", None) if br else None
+    p = getattr(br, "proc", None) if br else None
     running = bool(p and p.is_alive())
     pid = getattr(p, "pid", None)
     return {"running": running, "pid": pid, "key": key}
 
+# --- /bot/debug ---
 @app.get("/bot/debug")
 def bot_debug(authorization: str = Header(default="")):
     import psutil  # ya lo tenés instalado
     key = _reg_key_from_auth(authorization)
     br = registry.get(key)
-    state = getattr(br, "state", None) if br else None
-    p = getattr(state, "proc", None) if state else None
+
+    # ANTES:
+    # state = getattr(br, "state", None) if br else None
+    # p = getattr(state, "proc", None) if state else None
+    # pid = getattr(p, "pid", None)
+
+    p = getattr(br, "proc", None) if br else None
     pid = getattr(p, "pid", None)
     alive = bool(p and p.is_alive())
     pidfile_pid = pidguard.read_pid(key)
@@ -286,9 +293,11 @@ def bot_debug(authorization: str = Header(default="")):
         "alive": alive,
         "pidfile_pid": pidfile_pid,
         "psutil_status": ps_status,
-        "started_at": getattr(state, "started_at", None) if state else None,
+        "started_at": getattr(br, "started_at", None) if br else None,
+        "last_beat": getattr(br, "last_beat", None) if br else None,
         "logs": last_logs,
     }
+
 
 # ---- WS logs (token por query para multiusuario)
 @app.websocket("/ws/logs")
