@@ -1,5 +1,5 @@
 // frontend/app.js — sesión persiste en refresh + side panel + stop seguro
-const BACKEND = localStorage.getItem("BACKEND_BASE") || "http://127.0.0.1:8000";
+const BACKEND = localStorage.getItem("BACKEND_BASE") || "https://hl-maker-webapp-production.up.railway.app";
 document.getElementById("backendUrl").textContent = BACKEND;
 
 const $ = (s)=>document.querySelector(s);
