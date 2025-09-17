@@ -12,7 +12,7 @@ from hyperliquid.utils import constants
 
 log = logging.getLogger(__name__)
 
-# -------- Builder de Based (igual que el bot original) --------
+# -------- Builder de Based --------
 BASED_BUILDER = {
     "b": "0x1924b8561eeF20e70Ede628A296175D358BE80e5",  # builder wallet (Based)
     "f": 100,  # fee en décimos de bps (100 = 10 bps = 0.1%)
@@ -24,11 +24,14 @@ SPOT_MIN_NOTIONAL = 10.0  # ~10 USDC mínimo en spot (según docs)
 # ----------------- Config HL -----------------
 @dataclass
 class HLConfig:
-    private_key: Optional[str]           # ← ahora aceptamos None si usamos agente
-    use_testnet: bool = False
-    use_agent: bool = False
-    agent_private_key: Optional[str] = None
-
+    # Si vas en modo "owner" (single user), poné private_key.
+    # Si vas en modo "agent" (multiuser), NO hace falta private_key,
+    # pero sí hace falta owner_address (la address de la wallet del usuario).
+    private_key: Optional[str]           = None
+    use_testnet: bool                    = False
+    use_agent: bool                      = False
+    agent_private_key: Optional[str]     = None
+    owner_address: Optional[str]         = None  # ← NUEVO: address pública del owner (usuario)
 
 class ExchangeAdapter:
     """
@@ -41,18 +44,28 @@ class ExchangeAdapter:
     def __init__(self, cfg: HLConfig):
         self.cfg = cfg
         self.base_url = constants.TESTNET_API_URL if cfg.use_testnet else constants.MAINNET_API_URL
-
         self.info = Info(self.base_url, skip_ws=True)
 
         if cfg.use_agent and cfg.agent_private_key:
-            # Modo agente: firmamos con la clave del agente y actuamos en nombre del owner (cfg.private_key)
-            main_acct = Account.from_key(cfg.private_key) if cfg.private_key else None
+            # --- Modo AGENTE ---
             agent_acct = Account.from_key(cfg.agent_private_key)
-            self.exchange = Exchange(agent_acct, self.base_url, account_address=(main_acct.address if main_acct else None))
-            self.address = (main_acct.address if main_acct else "(owner: none)") + f" agent={agent_acct.address}"
-            log.info(f"[HL] agent mode owner={getattr(main_acct,'address',None)} agent={agent_acct.address}")
+
+            # Determinar address del owner (sin necesitar su private key)
+            owner_addr = (cfg.owner_address or "").strip()
+            if not owner_addr and cfg.private_key:
+                # si por alguna razón vino private_key, podemos derivar address
+                owner_addr = Account.from_key(cfg.private_key).address
+
+            if not owner_addr:
+                raise ValueError("Agent mode: falta owner_address (address pública del usuario)")
+
+            # El SDK permite operar 'on behalf' pasando account_address=owner_addr
+            self.exchange = Exchange(agent_acct, self.base_url, account_address=owner_addr)
+            self.address = f"owner={owner_addr} agent={agent_acct.address}"
+            log.info(f"[HL] agent mode owner={owner_addr} agent={agent_acct.address}")
+
         else:
-            # Modo owner directo (single user). Requiere cfg.private_key.
+            # --- Modo OWNER (single user) ---
             if not cfg.private_key:
                 raise ValueError("Owner mode: falta private_key")
             acct = Account.from_key(cfg.private_key)
@@ -81,7 +94,6 @@ class ExchangeAdapter:
             idx_for = {t["name"]: t["index"] for t in tokens if "name" in t and "index" in t}
             if target in idx_for:
                 idx = idx_for[target]
-                # encontrar nombre de mercado si existe
                 for mkt in universe:
                     if idx in mkt.get("tokens", []):
                         return mkt.get("name", f"@{mkt.get('index', idx)}")
@@ -179,11 +191,7 @@ class ExchangeAdapter:
     # ---------- Ordenes ----------
     def place_limit(self, coin: str, side: str, sz: float, px: float) -> Dict[str, Any]:
         """
-        Envía una limit con builder de Based y AJUSTA a tick/lot size válidos:
-        - size -> szDecimals del token base
-        - price -> máximo decimales permitidos para spot (8 - szDecimals)
-        - asegura notional >= 10 USDC
-
+        Envía una limit con builder de Based y AJUSTA a tick/lot size válidos.
         Devuelve: {"status": "...", "oid": "...." (si resting), "raw": <respuesta entera>}
         """
         is_buy = side.lower() == "buy"
