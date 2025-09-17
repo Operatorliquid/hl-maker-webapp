@@ -24,15 +24,10 @@ SPOT_MIN_NOTIONAL = 10.0  # ~10 USDC mínimo en spot (según docs)
 # ----------------- Config HL -----------------
 @dataclass
 class HLConfig:
-    # AHORA opcional: si vas a usar agente, podés dejarlo en None
-    private_key: Optional[str] = None
+    private_key: Optional[str]           # ← ahora aceptamos None si usamos agente
     use_testnet: bool = False
-
-    # agente (si viene, usamos agente). En modo agente SIN private_key,
-    # tenés que pasar owner_address (la wallet del usuario que aprobó el agente).
     use_agent: bool = False
     agent_private_key: Optional[str] = None
-    owner_address: Optional[str] = None  # <- NUEVO: dueño que aprobó al agente
 
 
 class ExchangeAdapter:
@@ -42,47 +37,25 @@ class ExchangeAdapter:
     - resuelve el 'coin' spot
     - helpers de balances / place_limit / cancel
     - AJUSTE de lot/tick size según spot_meta
-
-    Modos de operación:
-      • Owner (sin agente): requiere private_key
-      • Agent: requiere agent_private_key y:
-          - o bien private_key (del owner) para derivar owner_address
-          - o bien owner_address explícito (recomendado para multiusuario)
     """
     def __init__(self, cfg: HLConfig):
         self.cfg = cfg
         self.base_url = constants.TESTNET_API_URL if cfg.use_testnet else constants.MAINNET_API_URL
 
-        # --- MODO AGENTE ---
+        self.info = Info(self.base_url, skip_ws=True)
+
         if cfg.use_agent and cfg.agent_private_key:
+            # Modo agente: firmamos con la clave del agente y actuamos en nombre del owner (cfg.private_key)
+            main_acct = Account.from_key(cfg.private_key) if cfg.private_key else None
             agent_acct = Account.from_key(cfg.agent_private_key)
-
-            # Determinar owner_address:
-            if cfg.private_key:
-                # Si te pasaron private_key del owner, la usamos solo para derivar el address
-                main_acct = Account.from_key(cfg.private_key)
-                owner_addr = main_acct.address
-            else:
-                # Multiusuario: el backend debe proveer el address del usuario que aprobó al agente
-                if not cfg.owner_address:
-                    raise ValueError(
-                        "Agent mode: falta owner_address. "
-                        "Pasá HLConfig(owner_address=<wallet_del_usuario>) cuando uses agente sin private_key."
-                    )
-                owner_addr = cfg.owner_address
-
-            self.info = Info(self.base_url, skip_ws=True)
-            # Firmamos con el agente, pero operamos a nombre del 'owner_addr'
-            self.exchange = Exchange(agent_acct, self.base_url, account_address=owner_addr)
-            self.address = owner_addr
-            log.info(f"[HL] agent mode owner={owner_addr} agent={agent_acct.address}")
-
-        # --- MODO OWNER (sin agente) ---
+            self.exchange = Exchange(agent_acct, self.base_url, account_address=(main_acct.address if main_acct else None))
+            self.address = (main_acct.address if main_acct else "(owner: none)") + f" agent={agent_acct.address}"
+            log.info(f"[HL] agent mode owner={getattr(main_acct,'address',None)} agent={agent_acct.address}")
         else:
+            # Modo owner directo (single user). Requiere cfg.private_key.
             if not cfg.private_key:
-                raise ValueError("Owner mode: falta private_key (o activá use_agent con agent_private_key).")
+                raise ValueError("Owner mode: falta private_key")
             acct = Account.from_key(cfg.private_key)
-            self.info = Info(self.base_url, skip_ws=True)
             self.exchange = Exchange(acct, self.base_url)
             self.address = acct.address
             log.info(f"[HL] main wallet {self.address}")
@@ -140,7 +113,6 @@ class ExchangeAdapter:
             universe = sm.get("universe", [])
             idx_to_sz = {}
             for t in tokens:
-                # claves posibles: 'szDecimals' o 'sz_decimals'
                 szd = t.get("szDecimals", t.get("sz_decimals"))
                 if szd is not None:
                     idx_to_sz[t["index"]] = int(szd)
@@ -160,7 +132,6 @@ class ExchangeAdapter:
                         break
             if mkt is None and "/" in coin:
                 base = coin.split("/")[0].upper()
-                # buscar por nombre del token base
                 base_idx = None
                 for t in tokens:
                     if t.get("name") == base:
@@ -212,25 +183,24 @@ class ExchangeAdapter:
         - size -> szDecimals del token base
         - price -> máximo decimales permitidos para spot (8 - szDecimals)
         - asegura notional >= 10 USDC
+
+        Devuelve: {"status": "...", "oid": "...." (si resting), "raw": <respuesta entera>}
         """
         is_buy = side.lower() == "buy"
         sz_dec = self._sz_decimals_for_market(coin)
-        # precio spot: máx decimales = 8 - sz_dec (según docs)
-        px_dec = max(0, min(8 - sz_dec, 8))
+        px_dec = max(0, min(8 - sz_dec, 8))  # máx decimales precio
 
         # redondeos a la grilla
         step_sz = 10 ** (-sz_dec)
         size_q = max(step_sz, math.floor(sz / step_sz) * step_sz)  # truncar a paso válido
         limit_px = float(f"{px:.{px_dec}f}")
 
-        # asegurar notional mínimo (~10 USDC)
+        # notional mínimo
         if limit_px * size_q < SPOT_MIN_NOTIONAL:
             size_needed = (SPOT_MIN_NOTIONAL / max(limit_px, 1e-9))
-            # subimos al múltiplo de step_sz
             mult = math.ceil(size_needed / step_sz)
             size_q = mult * step_sz
 
-        # por seguridad, recortar a 8 decimales
         size_q = float(f"{size_q:.8f}")
 
         order_params = {"limit": {"tif": "Gtc"}, "cloid": BASED_CLOID}
@@ -245,11 +215,24 @@ class ExchangeAdapter:
                 order_type=order_params,
                 builder=BASED_BUILDER,
             )
+
+            # extraer OID si quedó resting
+            oid = None
+            try:
+                statuses = (res or {}).get("response", {}).get("data", {}).get("statuses", []) or []
+                for st in statuses:
+                    resting = st.get("resting") if isinstance(st, dict) else None
+                    if resting and "oid" in resting:
+                        oid = str(resting["oid"])
+                        break
+            except Exception:
+                oid = None
+
             log.info(f"[RES] {res}")
-            return res
+            return {"status": (res or {}).get("status", "unknown"), "oid": oid, "raw": res}
         except Exception as e:
             log.error(f"[ORDER-EXC] {e}")
-            return {"status": "error", "exception": str(e)}
+            return {"status": "error", "exception": str(e), "oid": None, "raw": None}
 
     def cancel(self, coin: str, oid: str) -> Dict[str, Any]:
         try:

@@ -1,6 +1,13 @@
 # src/maker_bot.py
 from __future__ import annotations
-import os, sys, json, time, argparse, logging, threading
+
+import os
+import sys
+import json
+import time
+import argparse
+import logging
+import threading
 from dataclasses import dataclass
 from typing import Optional, Dict, Tuple, Any, List
 
@@ -14,7 +21,8 @@ log = logging.getLogger("maker_bot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 MAINNET_WS = "wss://api.hyperliquid.xyz/ws"
-TESTNET_WS  = "wss://api.hyperliquid-testnet.xyz/ws"
+TESTNET_WS = "wss://api.hyperliquid-testnet.xyz/ws"
+
 
 # ----------------- WS L2Book -----------------
 class OrderBookWS:
@@ -59,10 +67,15 @@ class OrderBookWS:
         websocket.enableTrace(False)
         self.ws = websocket.WebSocketApp(
             self.ws_url,
-            on_open=self.on_open, on_message=self.on_message,
-            on_error=self.on_error, on_close=self.on_close
+            on_open=self.on_open,
+            on_message=self.on_message,
+            on_error=self.on_error,
+            on_close=self.on_close,
         )
-        t = threading.Thread(target=lambda: self.ws.run_forever(ping_interval=30, ping_timeout=10), daemon=True)
+        t = threading.Thread(
+            target=lambda: self.ws.run_forever(ping_interval=30, ping_timeout=10),
+            daemon=True,
+        )
         t.start()
         # esperar conexión
         for _ in range(60):
@@ -91,6 +104,7 @@ class OrderBookWS:
         ask = self._px(self.asks[0]) if self.asks else None
         return bid, ask
 
+
 # ----------------- BOT -----------------
 @dataclass
 class BotArgs:
@@ -103,12 +117,14 @@ class BotArgs:
     use_agent: bool
     agent_private_key: Optional[str]
 
+
 class MakerBot:
     def __init__(self, adapter: ExchangeAdapter, args: BotArgs):
         self.h = adapter
         self.args = args
         self.coin: Optional[str] = None
         self.ws: Optional[OrderBookWS] = None
+        # TTL: OIDs resting con timestamp de colocación
         self.resting: Dict[Any, float] = {}  # oid (int|str) -> t0
 
     def resolve_coin(self):
@@ -119,7 +135,7 @@ class MakerBot:
         self.ws = OrderBookWS(lambda: self.coin, self.h.cfg.use_testnet)
         self.ws.start()
 
-    # helpers
+    # ------- helpers -------
     @staticmethod
     def _spread_pct(bid: float, ask: float) -> float:
         return (ask - bid) / bid * 100.0 if bid and ask else 0.0
@@ -138,13 +154,24 @@ class MakerBot:
     def _extract_status_and_oid(res: dict) -> Tuple[str, Optional[Any]]:
         """
         Devuelve ('filled'|'resting'|'error', oid|None).
-        Soporta: 'resting', 'open', 'opened', 'placed', 'working', 'live', 'accepted', y 'filled'.
+        Primero intenta con el formato simplificado del adapter (res['oid']),
+        si no, parsea la respuesta cruda (res['raw']).
         """
         try:
-            if res.get("status") != "ok":
+            if not isinstance(res, dict):
                 return "error", None
 
-            data = res.get("response", {}).get("data", {})
+            # Formato simplificado que devuelve nuestro adapter
+            if res.get("oid"):
+                return "resting", res["oid"]
+            if res.get("status") == "error":
+                return "error", None
+
+            raw = res.get("raw") or res  # fallback
+            if not isinstance(raw, dict):
+                return "error", None
+
+            data = raw.get("response", {}).get("data", {})
             statuses = data.get("statuses", [])
             if not statuses or not isinstance(statuses, list):
                 return "error", None
@@ -204,6 +231,25 @@ class MakerBot:
             return oid  # devolvemos OID para manejar TTL
         return None
 
+    def _enforce_ttl(self, now: float):
+        """Cancela órdenes con más de ttl segundos vivas (si ttl > 0)."""
+        ttl = float(getattr(self.args, "ttl", 0) or 0)
+        if ttl <= 0:
+            return
+
+        to_cancel = [oid for oid, t0 in list(self.resting.items()) if now - t0 >= ttl]
+        for oid in to_cancel:
+            try:
+                if self._valid_oid(oid):
+                    coid = self._coerce_oid_for_cancel(oid)
+                    _ = self.h.cancel(self.coin, coid)
+                    log.info(f"[TTL] ORDEN CANCELADA {oid}")
+            except Exception as e:
+                log.warning(f"[TTL] cancel error {oid}: {e}")
+            finally:
+                self.resting.pop(oid, None)
+
+    # ------- loop principal -------
     def loop(self):
         last_status = 0.0
         while True:
@@ -214,13 +260,16 @@ class MakerBot:
                     continue
 
                 spread = self._spread_pct(bid, ask)
+                now = time.time()
+
                 if spread < self.args.min_spread:
                     time.sleep(0.25)
                     # status periódico
-                    now = time.time()
                     if now - last_status > 10:
                         log.info(f"[BOOK] bid={bid:.6f} ask={ask:.6f} spread={spread:.4f}%")
                         last_status = now
+                    # también aplicamos TTL aunque no coloquemos
+                    self._enforce_ttl(now)
                     continue
 
                 # precios
@@ -236,28 +285,16 @@ class MakerBot:
                 oid_b = self._place_limit_usd("buy",  buy_px, self.args.amount_per_level)
                 oid_s = self._place_limit_usd("sell", sell_px, self.args.amount_per_level)
 
-                now = time.time()
                 if self.args.maker_only:
-                    # guardar OIDs resting para cancelar por TTL (si son válidos)
+                    # registrar resting para TTL
                     if self._valid_oid(oid_b):
                         self.resting[oid_b] = now
                     if self._valid_oid(oid_s):
                         self.resting[oid_s] = now
-
-                    # cancelar por TTL
-                    to_cancel = [oid for oid, t0 in list(self.resting.items()) if now - t0 >= self.args.ttl]
-                    for oid in to_cancel:
-                        try:
-                            if self._valid_oid(oid):
-                                coid = self._coerce_oid_for_cancel(oid)
-                                _ = self.h.cancel(self.coin, coid)
-                                log.info(f"[TTL] ORDEN CANCELADA {oid}")
-                        except Exception as e:
-                            log.warning(f"[TTL] cancel error {oid}: {e}")
-                        finally:
-                            self.resting.pop(oid, None)
+                    # aplicar TTL
+                    self._enforce_ttl(now)
                 else:
-                    # en modo taker, si una quedó resting, la cancelamos rápido (comportamiento del bot original)
+                    # en modo taker, si alguna quedó resting, la cancelamos rápidamente
                     for oid in [oid_b, oid_s]:
                         if self._valid_oid(oid):
                             try:
@@ -280,6 +317,7 @@ class MakerBot:
                 log.error(f"loop error: {e}")
                 time.sleep(1.0)
 
+
 # ----------------- CLI -----------------
 def load_env_defaults():
     load_dotenv()
@@ -293,6 +331,7 @@ def load_env_defaults():
         "USE_AGENT": os.getenv("HL_USE_AGENT", "false").lower() == "true",
         "AGENT_PRIVATE_KEY": os.getenv("HL_AGENT_PRIVATE_KEY", ""),
     }
+
 
 def parse_args():
     env = load_env_defaults()
@@ -309,15 +348,16 @@ def parse_args():
     p.add_argument("--agent-private-key", default=env["AGENT_PRIVATE_KEY"])
     return p.parse_args()
 
+
 def main():
     args = parse_args()
     priv = os.getenv("HL_PRIVATE_KEY", "").strip()
-    if not priv:
-        print("Falta HL_PRIVATE_KEY en .env")
+    if not priv and not (args.use_agent and args.agent_private_key):
+        print("Falta HL_PRIVATE_KEY o agent_private_key (si --use-agent).")
         sys.exit(1)
 
     cfg = HLConfig(
-        private_key=priv,
+        private_key=priv or None,
         use_testnet=args.testnet,
         use_agent=args.use_agent,
         agent_private_key=args.agent_private_key or None,
@@ -341,6 +381,7 @@ def main():
     bot.resolve_coin()
     bot.start_ws()
     bot.loop()
+
 
 if __name__ == "__main__":
     main()
