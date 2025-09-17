@@ -1,22 +1,6 @@
-// PRODUCCIÓN por defecto → tu URL de Railway
+// frontend/app.js — sesión persiste en refresh + side panel + stop seguro
 const BACKEND = localStorage.getItem("BACKEND_BASE") || "https://hl-maker-webapp-production.up.railway.app";
-
-// (nuevo) seteo defensivo y visibilidad del footer
-const backendUrlEl = document.getElementById("backendUrl");
-const footDebug = document.getElementById("footDebug");
-const IS_LOCAL = ["localhost", "127.0.0.1"].includes(location.hostname);
-
-// Mostrar footer solo en local o si forzás con flag
-if (footDebug) {
-  if (IS_LOCAL || localStorage.getItem("SHOW_BACKEND") === "1") {
-    footDebug.classList.remove("hidden");
-    if (backendUrlEl) backendUrlEl.textContent = BACKEND;
-  } else {
-    // en prod queda oculto (no hace falta ni rellenar el texto)
-    footDebug.classList.add("hidden");
-  }
-}
-
+document.getElementById("backendUrl").textContent = BACKEND;
 
 const $ = (s)=>document.querySelector(s);
 const els = {
