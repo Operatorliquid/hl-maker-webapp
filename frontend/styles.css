@@ -102,12 +102,32 @@ select.field{appearance:none; background-image:url("data:image/svg+xml,%3Csvg xm
 .logs__head{display:flex; align-items:center; justify-content:space-between}
 .logs__head h3{margin:0; font-size:1rem; font-weight: 400;}
 .tag{font-size:.78rem; padding:.18rem .4rem; border:1px solid rgba(255,255,255,.18); border-radius:8px; color:var(--muted); background:rgba(255,255,255,.06)}
-.logs__box{
-  height:340px; padding:12px; border-radius:12px;
-  background: var(--logsGlass);
-  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
-  overflow:auto; white-space:pre-wrap; font-family:var(--mono); color:var(--ok); font-weight:300;
+.logs__box {
+  /* layout */
+  display: block;
+  height: 44vh;            /* alto fijo y scrolleable */
+  min-height: 260px;
+  overflow: auto;
+
+  /* que no se escape el texto */
+  white-space: pre-wrap;    /* respeta \n pero permite envolver */
+  word-break: break-word;   /* rompe palabras largas si hace falta */
+  overflow-wrap: anywhere;  /* fallback extra para Safari/Firefox */
+
+  /* estética */
+  margin: 0;
+  padding: 12px 14px;
+  font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  color: #8FFF5C;           /* verde del log */
+  background: rgba(39,37,37,0.65);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 16px;
 }
+
+/* opcional: scrollbar más fino */
+.logs__box::-webkit-scrollbar { height: 8px; width: 8px; }
+.logs__box::-webkit-scrollbar-thumb { background: rgba(255,255,255,.18); border-radius: 8px; }
 .logs__sample{font-size:.85rem; color:#CFE8E2; display:none important!;}
 .logs__sample span{color:var(--ok)
 }
