@@ -5,9 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from typing import Optional, Dict
-
 import os, uuid, time
-
 
 from api import pidguard
 
@@ -26,7 +24,7 @@ from eth_account.messages import encode_defunct
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 
-app = FastAPI(title="hl-maker-webapi", version="0.5")
+app = FastAPI(title="hl-maker-webapi", version="0.6")
 
 # ---- CORS
 ALLOW_ORIGINS = (os.getenv("ALLOW_ORIGINS") or "*").split(",")
@@ -72,11 +70,23 @@ NONCES: Dict[str, str] = {}     # address_lower -> nonce
 SESSIONS: Dict[str, dict] = {}  # token -> {address, created_at}
 
 # ---- helpers
-from typing import Optional
-
 def _get_server_key() -> Optional[str]:
     priv = (os.getenv("HL_PRIVATE_KEY") or "").strip()
     return priv or None
+
+def _address_from_auth(authorization: str) -> Optional[str]:
+    """
+    Extrae la address del usuario (de SESSIONS) a partir del header Authorization: Bearer <token>.
+    """
+    if not authorization:
+        return None
+    parts = authorization.split()
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        tok = parts[1]
+        sess = SESSIONS.get(tok)
+        if sess and "address" in sess:
+            return str(sess["address"]).lower()
+    return None
 
 def _reg_key_from_auth(authorization: str) -> str:
     """
@@ -92,23 +102,39 @@ def _reg_key_from_auth(authorization: str) -> str:
             return f"user:{tok}"
     return "owner"
 
-def _build_cfg(req: StartReq) -> HLConfig:
-    # si vino agent_private_key y use_agent = true, usamos agente
+def _build_cfg(req: StartReq, owner_addr: Optional[str]) -> HLConfig:
+    """
+    Construye HLConfig:
+      - Si use_agent + agent_private_key, NO exigimos HL_PRIVATE_KEY.
+        En ese caso, si no hay HL_PRIVATE_KEY necesitamos owner_addr (wallet del user).
+      - Si NO use_agent, sí exigimos HL_PRIVATE_KEY (modo owner).
+    """
     agent_key = (req.agent_private_key or "").strip() if req.use_agent else ""
     server_key = _get_server_key()
 
-    # validación: tiene que venir al menos una clave (agente o server)
-    if not agent_key and not server_key:
-        raise HTTPException(
-            status_code=400,
-            detail="Falta clave: enviá agent_private_key (use_agent=true) o definí HL_PRIVATE_KEY en el server."
-        )
+    # Validaciones
+    if agent_key:
+        # Modo agente
+        if not server_key and not owner_addr:
+            # Multiusuario puro: necesitamos el address del usuario autenticado
+            raise HTTPException(
+                status_code=400,
+                detail="Falta address de usuario. Conectá la wallet (login) antes de iniciar el bot en modo agente."
+            )
+    else:
+        # Modo owner: necesita server key
+        if not server_key:
+            raise HTTPException(
+                status_code=400,
+                detail="Falta HL_PRIVATE_KEY en server (o enviá agent_private_key y use_agent=true)."
+            )
 
     return HLConfig(
         private_key=server_key,             # puede ser None si usamos agente
         use_testnet=req.testnet,
         use_agent=bool(agent_key),
         agent_private_key=agent_key or None,
+        owner_address=owner_addr,           # <- importante para modo agente sin server key
     )
 
 def _build_args(req: StartReq, cfg: HLConfig) -> BotArgs:
@@ -158,8 +184,11 @@ def auth_verify(req: VerifyReq):
 # ---- bot
 @app.post("/bot/start")
 def start_bot(req: StartReq, authorization: str = Header(default="")):
+    # Owner address del usuario autenticado (si hay token)
+    owner_addr = _address_from_auth(authorization)
+
     # Nota: agent_private_key viene en el body (si el user quiere usar agente).
-    cfg = _build_cfg(req)
+    cfg = _build_cfg(req, owner_addr)
     args = _build_args(req, cfg)
     key = _reg_key_from_auth(authorization)
     registry.start(key, cfg, args)
@@ -199,7 +228,6 @@ async def stop_by_token(req: Request):
     pidguard.kill_key(key)
     return {"ok": True}
 
-
 # Martillo global por si queda algo vivo (opcional)
 @app.post("/bot/stop_all")
 def stop_all():
@@ -214,7 +242,6 @@ def status(authorization: str = Header(default="")):
     running = bool(p and p.is_alive())
     pid = getattr(p, "pid", None)
     return {"running": running, "pid": pid, "key": key}
-
 
 @app.get("/bot/debug")
 def bot_debug(authorization: str = Header(default="")):
@@ -247,7 +274,6 @@ def bot_debug(authorization: str = Header(default="")):
         "started_at": getattr(state, "started_at", None) if state else None,
         "logs": last_logs,
     }
-
 
 # ---- WS logs (token por query para multiusuario)
 @app.websocket("/ws/logs")
