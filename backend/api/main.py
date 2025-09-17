@@ -184,15 +184,30 @@ def auth_verify(req: VerifyReq):
 # ---- bot
 @app.post("/bot/start")
 def start_bot(req: StartReq, authorization: str = Header(default="")):
-    # Owner address del usuario autenticado (si hay token)
-    owner_addr = _address_from_auth(authorization)
+    try:
+        # Owner address del usuario autenticado (si hay token)
+        owner_addr = _address_from_auth(authorization)
 
-    # Nota: agent_private_key viene en el body (si el user quiere usar agente).
-    cfg = _build_cfg(req, owner_addr)
-    args = _build_args(req, cfg)
-    key = _reg_key_from_auth(authorization)
-    registry.start(key, cfg, args)
-    return {"ok": True, "using_agent": bool(cfg.use_agent)}
+        # agent_private_key viene en el body si el user usa agente
+        cfg = _build_cfg(req, owner_addr)
+        args = _build_args(req, cfg)
+        key = _reg_key_from_auth(authorization)
+
+        registry.start(key, cfg, args)
+        return {"ok": True, "using_agent": bool(cfg.use_agent), "key": key, "owner": owner_addr}
+    except HTTPException:
+        # Dejá que FastAPI devuelva el 4xx con su detalle
+        raise
+    except Exception as e:
+        import logging, traceback
+        logging.exception("start_bot failed")
+        # Devolvemos 400 con el texto del error para debug rápido
+        return Response(
+            content=f'{{"ok":false,"error":"{type(e).__name__}: {str(e)}"}}',
+            media_type="application/json",
+            status_code=400
+        )
+
 
 @app.post("/bot/stop")
 def stop_bot(authorization: str = Header(default="")):
