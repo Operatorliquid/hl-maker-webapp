@@ -50,12 +50,22 @@ function setRunning(isOn){
   if (els.statusText) els.statusText.textContent = isOn ? "Running" : "Stopped";
   if (els.panelStatus) els.panelStatus.textContent = isOn ? "Running" : "Stopped";
 }
+
+const LOG_MAX_CHARS = 250000;  // ~250 KB de texto (ajustable)
+
 function appendLog(line){
   const box = els.logBox;
   if(!box) return;
   const atBottom = Math.abs(box.scrollHeight - box.scrollTop - box.clientHeight) < 4;
+
   box.textContent += (box.textContent ? "\n" : "") + line;
-  if(atBottom) box.scrollTop = box.scrollHeight;
+
+  // recorte por tamaño (más rápido que contar líneas)
+  if (box.textContent.length > LOG_MAX_CHARS) {
+    box.textContent = box.textContent.slice(-LOG_MAX_CHARS);
+  }
+
+  if (atBottom) box.scrollTop = box.scrollHeight;
 }
 const short = (a)=> a ? (a.slice(0,6)+"…"+a.slice(-4)) : "";
 
