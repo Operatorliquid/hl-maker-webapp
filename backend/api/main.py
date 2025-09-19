@@ -1,3 +1,7 @@
+import requests
+from fastapi import Query
+from fastapi.responses import JSONResponse
+
 # backend/api/main.py
 from fastapi import Request
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header
@@ -352,3 +356,22 @@ def spot_meta():
         except Exception:
             continue
     return {"ok": True, "meta": out}
+
+# === LIQD recent proxy (CORS-safe) ===
+@app.get("/liqd/recent_proxy")
+def liqd_recent_proxy(limit: int = Query(24, ge=1, le=200)):
+    """
+    Proxy simple para evitar CORS al consultar https://api.liqd.ag/tokens
+    - limit: 1..200
+    - Devuelve el JSON tal cual. En error, retorna {"tokens": [], "error": "..."} con 200.
+    """
+    try:
+        resp = requests.get(
+            "https://api.liqd.ag/tokens",
+            params={"limit": limit},
+            timeout=6,
+        )
+        resp.raise_for_status()
+        return JSONResponse(content=resp.json())
+    except Exception as e:
+        return JSONResponse(content={"tokens": [], "error": str(e)}, status_code=200)
