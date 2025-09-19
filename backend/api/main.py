@@ -357,21 +357,53 @@ def spot_meta():
             continue
     return {"ok": True, "meta": out}
 
-# === LIQD recent proxy (CORS-safe) ===
+# === LIQD recent proxy (CORS-safe + headers + fallbacks) ===
 @app.get("/liqd/recent_proxy")
 def liqd_recent_proxy(limit: int = Query(24, ge=1, le=200)):
     """
-    Proxy simple para evitar CORS al consultar https://api.liqd.ag/tokens
-    - limit: 1..200
-    - Devuelve el JSON tal cual. En error, retorna {"tokens": [], "error": "..."} con 200.
+    Proxy a https://api.liqd.ag/tokens con headers explícitos.
+    - Envía User-Agent y Accept para evitar 403 por filtros anti-bot.
+    - Si 403/errores: intenta variantes de URL como fallback.
+    - Siempre retorna JSON (en error: {"tokens": [], "error": "..."}).
     """
-    try:
-        resp = requests.get(
-            "https://api.liqd.ag/tokens",
-            params={"limit": limit},
-            timeout=6,
-        )
-        resp.raise_for_status()
-        return JSONResponse(content=resp.json())
-    except Exception as e:
-        return JSONResponse(content={"tokens": [], "error": str(e)}, status_code=200)
+    headers = {
+        "User-Agent": "OperatorLiquidBot/1.0 (+https://hl-maker-webapp-production.up.railway.app)",
+        "Accept": "application/json",
+        "Connection": "close",
+    }
+
+    bases = [
+        ("https://api.liqd.ag/tokens", {"limit": limit}),
+        # fallbacks por si el upstream exige otra ruta o ignora params:
+        ("https://api.liqd.ag/tokens", None),
+        ("https://api.liqd.ag/v2/tokens", {"limit": limit}),
+        ("https://api.liqd.ag/v2/tokens", None),
+    ]
+
+    for url, params in bases:
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=6)
+            # si 403, probá siguiente variante
+            if resp.status_code == 403:
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            # normalizar: queremos un array bajo "tokens" si el upstream cambia el shape
+            if isinstance(data, list):
+                out = data[:limit]
+            elif isinstance(data, dict):
+                arr = data.get("tokens") or data.get("data") or data.get("items") or []
+                if isinstance(arr, list):
+                    out = arr[:limit]
+                else:
+                    out = []
+            else:
+                out = []
+            return JSONResponse(content={"tokens": out})
+        except Exception as e:
+            # seguimos intentando siguiente variante
+            last_err = str(e)
+
+    # si nada funcionó:
+    return JSONResponse(content={"tokens": [], "error": last_err if 'last_err' in locals() else "unknown"}, status_code=200)
+
