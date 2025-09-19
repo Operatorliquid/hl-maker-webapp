@@ -1,6 +1,7 @@
 import requests
 from fastapi import Query
 from fastapi.responses import JSONResponse
+import re
 
 # backend/api/main.py
 from fastapi import Request
@@ -357,14 +358,13 @@ def spot_meta():
             continue
     return {"ok": True, "meta": out}
 
-# === LIQD recent proxy (CORS-safe + headers + fallbacks) ===
+# === LIQD recent proxy (headers + fallbacks + HTML scrape) ===
 @app.get("/liqd/recent_proxy")
 def liqd_recent_proxy(limit: int = Query(24, ge=1, le=200)):
     """
-    Proxy a https://api.liqd.ag/tokens con headers explícitos.
-    - Envía User-Agent y Accept para evitar 403 por filtros anti-bot.
-    - Si 403/errores: intenta variantes de URL como fallback.
-    - Siempre retorna JSON (en error: {"tokens": [], "error": "..."}).
+    Intenta traer recent desde api.liqd.ag.
+    Si falla (403/empty), hace fallback scraping de https://liquidscan.fun/recent
+    y devuelve un listado mínimo [{"address": "..."}].
     """
     headers = {
         "User-Agent": "OperatorLiquidBot/1.0 (+https://hl-maker-webapp-production.up.railway.app)",
@@ -374,36 +374,58 @@ def liqd_recent_proxy(limit: int = Query(24, ge=1, le=200)):
 
     bases = [
         ("https://api.liqd.ag/tokens", {"limit": limit}),
-        # fallbacks por si el upstream exige otra ruta o ignora params:
         ("https://api.liqd.ag/tokens", None),
         ("https://api.liqd.ag/v2/tokens", {"limit": limit}),
         ("https://api.liqd.ag/v2/tokens", None),
     ]
 
+    last_err = "unknown"
+    # 1) Intento API oficial con varios paths
     for url, params in bases:
         try:
             resp = requests.get(url, params=params, headers=headers, timeout=6)
-            # si 403, probá siguiente variante
             if resp.status_code == 403:
+                last_err = f"403 on {url}"
                 continue
             resp.raise_for_status()
             data = resp.json()
-            # normalizar: queremos un array bajo "tokens" si el upstream cambia el shape
             if isinstance(data, list):
                 out = data[:limit]
             elif isinstance(data, dict):
                 arr = data.get("tokens") or data.get("data") or data.get("items") or []
-                if isinstance(arr, list):
-                    out = arr[:limit]
-                else:
-                    out = []
+                out = arr[:limit] if isinstance(arr, list) else []
             else:
                 out = []
-            return JSONResponse(content={"tokens": out})
+            if out:
+                return JSONResponse(content={"tokens": out})
+            last_err = f"empty on {url}"
         except Exception as e:
-            # seguimos intentando siguiente variante
-            last_err = str(e)
+            last_err = f"{type(e).__name__}: {e}"
 
-    # si nada funcionó:
-    return JSONResponse(content={"tokens": [], "error": last_err if 'last_err' in locals() else "unknown"}, status_code=200)
+    # 2) Fallback: scrape HTML de liquidscan.fun/recent (simple, robusto)
+    try:
+        html = requests.get("https://liquidscan.fun/recent", headers=headers, timeout=6).text
+        # Buscar addresses en rutas tipo /token/0xabc... o /token/<hex>
+        # Capturamos 40+ hex (por si no llevan '0x' en el path)
+        addrs = []
+        for m in re.finditer(r'/token/(0x[a-fA-F0-9]{40}|[a-fA-F0-9]{40,64})', html):
+            addr = m.group(1)
+            # normalizar: si no trae 0x y tiene 40 chars, lo asumimos EVM y le añadimos 0x
+            if not addr.startswith("0x") and len(addr) == 40:
+                addr = "0x" + addr
+            addrs.append(addr)
+        # dedupe conservando orden
+        seen = set()
+        uniq = []
+        for a in addrs:
+            if a and a not in seen:
+                seen.add(a)
+                uniq.append(a)
+        tokens = [{"address": a} for a in uniq[:limit]]
+        if tokens:
+            return JSONResponse(content={"tokens": tokens})
+        last_err = "scrape_empty"
+    except Exception as e:
+        last_err = f"scrape_error: {e}"
 
+    return JSONResponse(content={"tokens": [], "error": last_err}, status_code=200)
