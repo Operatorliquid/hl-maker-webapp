@@ -12,6 +12,7 @@ router = APIRouter()
 # Opcional: relay para LIQD (Cloudflare Worker / Vercel)
 LIQD_WORKER_URL = (os.getenv("LIQD_WORKER_URL") or "").strip()  # ej: https://tu-worker.workers.dev
 
+
 @router.get("/liqd/recent_proxy")
 def liqd_recent_proxy(
     limit: int = Query(24, ge=1, le=200),
@@ -63,8 +64,8 @@ def liqd_recent_proxy(
 
 @router.get("/liqd/recent_unbonded_chain")
 def liqd_recent_unbonded_chain(
-    limit: int = Query(100, ge=10, le=100),
-    page_size: size = min(page_size, total - start),
+    limit: int = Query(24, ge=1, le=200),
+    page_size: int = Query(100, ge=10, le=100),
 ):
     """
     On-chain puro:
@@ -76,7 +77,6 @@ def liqd_recent_unbonded_chain(
     try:
         w3, c = get_contract()
     except Exception as e:
-        # e ya viene como HTTPException si falla RPC
         from fastapi import HTTPException
         if isinstance(e, HTTPException):
             return JSONResponse({"tokens": [], "count": 0, "error": e.detail}, status_code=200)
@@ -91,7 +91,7 @@ def liqd_recent_unbonded_chain(
     remaining = limit
     while remaining > 0 and total > 0:
         start = max(0, total - page_size)
-        size = total - start
+        size = min(page_size, total - start)  # <= importante
         try:
             tokens, metas = c.functions.getPaginatedTokensWithMetadata(start, size).call()
         except Exception:
@@ -205,7 +205,7 @@ def liqd_recent_unbonded(limit: int = Query(24, ge=1, le=200)):
 @router.get("/liqd/recent_frozen")
 def liqd_recent_frozen(
     limit: int = Query(24, ge=1, le=200),
-    page_size: int = Query(200, ge=10, le=1000),
+    page_size: int = Query(100, ge=10, le=100),  # <= acotado
 ):
     """
     Tokens LiquidLaunch con isFrozen=true (listos para migrar).
@@ -227,7 +227,7 @@ def liqd_recent_frozen(
         return JSONResponse({"tokens": [], "count": 0}, status_code=200)
 
     start = max(0, total - page_size)
-    size  = total - start
+    size  = min(page_size, total - start)  # <= importante
     try:
         tokens, metas = c.functions.getPaginatedTokensWithMetadata(start, size).call()
     except Exception as e:
@@ -290,13 +290,26 @@ def liqd_rpc_health():
     any_ok = any(r["connected"] for r in results)
     return {"ok": any_ok, "rpcs": results}
 
+
 @router.get("/liqd/recent_tokens_rpc")
 def liqd_recent_tokens_rpc(
     limit: int = Query(30, ge=1, le=200),
     bonded: str = Query("both", pattern="^(both|unbonded|bonded)$"),
-    page_size: int = Query(100, ge=50, le=100),  # <- MAX 100
+    page_size: int = Query(100, ge=50, le=100),  # MAX 100
 ):
-    # ...
+    """
+    Lista recientes directo por RPC; bonded: both|unbonded|bonded
+    """
+    # conectar contrato
+    try:
+        w3, c = get_contract()
+    except Exception as e:
+        from fastapi import HTTPException
+        if isinstance(e, HTTPException):
+            return JSONResponse({"tokens": [], "count": 0, "error": e.detail}, status_code=200)
+        return JSONResponse({"tokens": [], "count": 0, "error": str(e)}, status_code=200)
+
+    # total
     try:
         total = int(c.functions.getTokenCount().call())
     except Exception as e:
@@ -305,14 +318,14 @@ def liqd_recent_tokens_rpc(
     if total <= 0:
         return JSONResponse({"tokens": [], "count": 0}, status_code=200)
 
+    # bloque desde el final
     start = max(0, total - page_size)
-    size  = min(page_size, total - start)  # <- no pasarse
+    size  = min(page_size, total - start)
     try:
         addrs, metas = c.functions.getPaginatedTokensWithMetadata(start, size).call()
     except Exception as e:
         return JSONResponse({"tokens": [], "count": 0, "error": f"getPaginated: {e}"}, status_code=200)
 
-    # --- si el contrato devuelve vacío, devolvemos la info de página para debug
     if not addrs:
         return JSONResponse({
             "tokens": [],
@@ -358,6 +371,7 @@ def liqd_recent_tokens_rpc(
         "pageInfo": {"total": total, "start": start, "size": size, "returned": len(addrs)}
     }, status_code=200)
 
+
 @router.get("/liqd/_ll_debug")
 def liqd_ll_debug(page_size: int = 50):
     """
@@ -396,7 +410,7 @@ def liqd_ll_debug(page_size: int = 50):
         return info
 
     start = max(0, total - page_size)
-    size  = total - start
+    size  = min(page_size, total - start)
     sample = []
     try:
         addrs, metas = c.functions.getPaginatedTokensWithMetadata(start, size).call()
@@ -406,7 +420,6 @@ def liqd_ll_debug(page_size: int = 50):
                 _a, isBonded, ts = c.functions.getTokenBondingStatus(a).call()
             except Exception:
                 isBonded, ts = None, None
-            # mostramos name/symbol por si ayuda
             m = metas[i]
             sample.append({
                 "address": a,
