@@ -6,6 +6,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from typing import Optional, Dict
 import os, uuid, time
+from api.liqd_routes import router as liqd_router
 
 from api import pidguard
 
@@ -25,6 +26,8 @@ from hyperliquid.info import Info
 from hyperliquid.utils import constants
 
 app = FastAPI(title="hl-maker-webapi", version="0.6")
+
+app.include_router(liqd_router, prefix="")
 
 # ---- CORS
 ALLOW_ORIGINS = (os.getenv("ALLOW_ORIGINS") or "*").split(",")
