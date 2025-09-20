@@ -27,7 +27,7 @@ from hyperliquid.utils import constants
 import httpx
 
 # Opcional: relay para LIQD (Cloudflare Worker / Vercel)
-LIQD_WORKER_URL = (os.getenv("summer-sea-4071.josestratta4.workers.dev") or "").strip()
+LIQD_WORKER_URL = (os.getenv("LIQD_WORKER_URL") or "").strip()  # ej: https://summer-sea-4071.josestratta4.workers.dev
 
 app = FastAPI(title="hl-maker-webapi", version="0.6")
 
@@ -481,6 +481,18 @@ _LL_ABI_MIN = [
   }
 ]
 
+# --- agregar función de estado 'frozen' (no rompe nada de lo anterior) ---
+_LL_ABI_MIN.append({
+  "inputs":[{"internalType":"address","name":"token","type":"address"}],
+  "name":"getTokenFrozenStatus",
+  "outputs":[
+    {"internalType":"address","name":"tokenAddress","type":"address"},
+    {"internalType":"bool","name":"isFrozen","type":"bool"},
+    {"internalType":"uint256","name":"frozenTimestamp","type":"uint256"}
+  ],
+  "stateMutability":"view","type":"function"
+})
+
 def _created_ms(item: dict) -> int:
     v = item.get("creationTimestamp") or item.get("created_at") or item.get("createdAt")
     if v is None:
@@ -498,7 +510,8 @@ def _created_ms(item: dict) -> int:
 def _get_ll_contract():
     if Web3 is None:
         raise HTTPException(status_code=500, detail="web3 no instalado (pip install web3)")
-    w3 = Web3(Web3.HTTPProvider(HYPER_RPC_URL, request_kwargs={"timeout": 8}))
+    # subimos un poco el timeout del RPC para mayor estabilidad
+    w3 = Web3(Web3.HTTPProvider(HYPER_RPC_URL, request_kwargs={"timeout": 15}))
     if not w3.is_connected():
         raise HTTPException(status_code=502, detail="RPC HyperEVM no disponible")
     c = w3.eth.contract(address=LL_CONTRACT_ADDR or LL_ADDRESS_RAW, abi=_LL_ABI_MIN)
@@ -642,4 +655,64 @@ def liqd_recent_unbonded(limit: int = Query(24, ge=1, le=200)):
             break
 
     out.sort(key=_created_ms, reverse=True)
+    return JSONResponse({"tokens": out, "count": len(out)}, status_code=200)
+
+# ---- Endpoint: frozen (listos para migrar) ---------------------------
+@app.get("/liqd/recent_frozen")
+def liqd_recent_frozen(
+    limit: int = Query(24, ge=1, le=200),
+    page_size: int = Query(200, ge=10, le=1000),
+):
+    """
+    Lista tokens de LiquidLaunch que están 'frozen' (listos para migrar).
+    Trae el último bloque paginado (más nuevos primero) y filtra por isFrozen=true.
+    Ordena por frozenTimestamp desc (más “frescos” arriba).
+    """
+    try:
+        w3, c = _get_ll_contract()
+    except HTTPException as e:
+        return JSONResponse({"tokens": [], "count": 0, "error": e.detail}, status_code=200)
+
+    try:
+        total = int(c.functions.getTokenCount().call())
+    except Exception as e:
+        return JSONResponse({"tokens": [], "count": 0, "error": f"getTokenCount: {e}"}, status_code=200)
+
+    if total <= 0:
+        return JSONResponse({"tokens": [], "count": 0}, status_code=200)
+
+    start = max(0, total - page_size)
+    size  = total - start
+    try:
+        tokens, metas = c.functions.getPaginatedTokensWithMetadata(start, size).call()
+    except Exception as e:
+        return JSONResponse({"tokens": [], "count": 0, "error": f"getPaginated: {e}"}, status_code=200)
+
+    out: List[dict] = []
+    # Recorremos del más nuevo al más viejo
+    for i in reversed(range(len(tokens))):
+        addr = tokens[i]
+        meta = metas[i]
+        try:
+            _a, isFrozen, fts = c.functions.getTokenFrozenStatus(addr).call()
+        except Exception:
+            continue
+        if not isFrozen:
+            continue
+        # meta[0]=name, meta[1]=symbol, meta[9]=creationTimestamp (segundos)
+        try:
+            ct = int(meta[9]) if str(meta[9]).isdigit() else 0
+        except Exception:
+            ct = 0
+        out.append({
+            "address": addr,
+            "name": meta[0],
+            "symbol": meta[1],
+            "creationTimestamp": ct,
+            "frozenTimestamp": int(fts) if str(fts).isdigit() else 0,
+        })
+        if len(out) >= limit:
+            break
+
+    out.sort(key=lambda x: x.get("frozenTimestamp", 0), reverse=True)
     return JSONResponse({"tokens": out, "count": len(out)}, status_code=200)
