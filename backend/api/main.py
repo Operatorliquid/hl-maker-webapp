@@ -407,7 +407,15 @@ try:
 except Exception:
     Web3 = None  # si no está instalado, devolvemos error amable
 
-HYPER_RPC_URL = os.getenv("HYPER_RPC_URL", "https://rpc.hyperliquid.xyz/evm")
+# --- RPCs con fallback (primero ENV, luego oficiales y mirrors públicos) ---
+_default_rpc_pool = [
+    os.getenv("HYPER_RPC_URL", "").strip(),        # opcional: tu preferido
+    "https://rpc.hyperliquid.xyz/evm",             # oficial
+    os.getenv("HYPER_RPC_URL_2", "").strip(),      # opcional: segundo personalizado
+    "https://hyperliquid.drpc.org",                # mirror público dRPC
+]
+HYPER_RPC_URLS = [u for u in _default_rpc_pool if u] or ["https://rpc.hyperliquid.xyz/evm"]
+
 LL_ADDRESS_RAW = "0xDEC3540f5BA6f2aa3764583A9c29501FeB020030"
 LL_CONTRACT_ADDR = None
 if Web3 is not None:
@@ -508,14 +516,26 @@ def _created_ms(item: dict) -> int:
             return 0
 
 def _get_ll_contract():
+    """
+    Intenta conectar contra un pool de RPCs (HYPER_RPC_URLS) con timeout de 15s.
+    Devuelve (w3, contrato) o levanta HTTPException 502 con detalle del último error.
+    """
     if Web3 is None:
         raise HTTPException(status_code=500, detail="web3 no instalado (pip install web3)")
-    # subimos un poco el timeout del RPC para mayor estabilidad
-    w3 = Web3(Web3.HTTPProvider(HYPER_RPC_URL, request_kwargs={"timeout": 15}))
-    if not w3.is_connected():
-        raise HTTPException(status_code=502, detail="RPC HyperEVM no disponible")
-    c = w3.eth.contract(address=LL_CONTRACT_ADDR or LL_ADDRESS_RAW, abi=_LL_ABI_MIN)
-    return w3, c
+
+    last_err = None
+    for rpc in HYPER_RPC_URLS:
+        try:
+            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
+            if not w3.is_connected():
+                last_err = f"no_connect:{rpc}"
+                continue
+            c = w3.eth.contract(address=LL_CONTRACT_ADDR or LL_ADDRESS_RAW, abi=_LL_ABI_MIN)
+            return w3, c
+        except Exception as e:
+            last_err = f"{type(e).__name__}@{rpc}: {e}"
+
+    raise HTTPException(status_code=502, detail=f"RPC HyperEVM no disponible ({last_err})")
 
 # ---- Endpoint: on-chain puro (no depende de api.liqd.ag)
 @app.get("/liqd/recent_unbonded_chain")
@@ -690,7 +710,7 @@ def liqd_recent_frozen(
 
     out: List[dict] = []
     # Recorremos del más nuevo al más viejo
-    for i in reversed(range(len(tokens))):
+    for i in reversed(range(len(tokens)))):
         addr = tokens[i]
         meta = metas[i]
         try:
@@ -716,3 +736,32 @@ def liqd_recent_frozen(
 
     out.sort(key=lambda x: x.get("frozenTimestamp", 0), reverse=True)
     return JSONResponse({"tokens": out, "count": len(out)}, status_code=200)
+
+# ---- Healthcheck de RPCs --------------------------------------------
+@app.get("/liqd/rpc_health")
+def liqd_rpc_health():
+    """
+    Devuelve el estado de conectividad a cada RPC del pool.
+    Ej: {"ok": true, "rpcs":[{"rpc":"...","connected":true,"blockNumber":123}, ...]}
+    """
+    try:
+        from web3 import Web3 as _W3
+    except Exception:
+        return {"ok": False, "error": "web3_missing", "rpcs": HYPER_RPC_URLS}
+
+    results = []
+    for rpc in HYPER_RPC_URLS:
+        st = {"rpc": rpc, "connected": False, "blockNumber": None, "error": None}
+        try:
+            w3 = _W3(_W3.HTTPProvider(rpc, request_kwargs={"timeout": 8}))
+            st["connected"] = bool(w3.is_connected())
+            if st["connected"]:
+                try:
+                    st["blockNumber"] = int(w3.eth.block_number)
+                except Exception as e:
+                    st["error"] = f"blockNumber:{e}"
+        except Exception as e:
+            st["error"] = str(e)
+        results.append(st)
+    any_ok = any(r["connected"] for r in results)
+    return {"ok": any_ok, "rpcs": results}
