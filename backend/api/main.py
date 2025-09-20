@@ -394,3 +394,173 @@ def liqd_recent_proxy(
           return JSONResponse(content={"tokens": [], "error": data.get("error", "empty")}, status_code=200)
     except Exception as e:
       return JSONResponse(content={"tokens": [], "error": str(e)}, status_code=200)
+
+      # === LIQD: recent unbonded (LiquidLaunch-only) ==============================
+from typing import List
+import json
+from functools import lru_cache
+
+# Web3 para leer estado en HyperEVM
+try:
+    from web3 import Web3
+    from web3.exceptions import ContractLogicError
+except Exception:
+    Web3 = None  # si no está instalado, devolvemos un error amable más abajo
+
+HYPER_RPC_URL = os.getenv("HYPER_RPC_URL", "https://rpc.hyperliquid.xyz/evm")
+LL_CONTRACT_ADDR = Web3.to_checksum_address("0xDEC3540f5BA6f2aa3764583A9c29501FeB020030") if Web3 else "0xDEC3540f5BA6f2aa3764583A9c29501FeB020030"
+
+# ABI mínimo: sólo lo que usamos
+_LL_ABI = json.loads("""
+[
+  {
+    "inputs":[{"internalType":"address","name":"token","type":"address"}],
+    "name":"getTokenBondingStatus",
+    "outputs":[
+      {"internalType":"address","name":"tokenAddress","type":"address"},
+      {"internalType":"bool","name":"isBonded","type":"bool"},
+      {"internalType":"uint256","name":"bondedTimestamp","type":"uint256"}
+    ],
+    "stateMutability":"view","type":"function"
+  },
+  {
+    "inputs":[{"internalType":"address","name":"token","type":"address"}],
+    "name":"getTokenMetadata",
+    "outputs":[
+      {
+        "components":[
+          {"internalType":"string","name":"name","type":"string"},
+          {"internalType":"string","name":"symbol","type":"string"},
+          {"internalType":"string","name":"image_uri","type":"string"},
+          {"internalType":"string","name":"description","type":"string"},
+          {"internalType":"string","name":"website","type":"string"},
+          {"internalType":"string","name":"twitter","type":"string"},
+          {"internalType":"string","name":"telegram","type":"string"},
+          {"internalType":"string","name":"discord","type":"string"},
+          {"internalType":"address","name":"creator","type":"address"},
+          {"internalType":"uint256","name":"creationTimestamp","type":"uint256"},
+          {"internalType":"uint256","name":"startingLiquidity","type":"uint256"},
+          {"internalType":"uint8","name":"dexIndex","type":"uint8"}
+        ],
+        "internalType":"struct TokenMetadata","name":"","type":"tuple"
+      }
+    ],
+    "stateMutability":"view","type":"function"
+  }
+]
+""")
+
+@lru_cache(maxsize=1)
+def _w3_and_contract():
+    if Web3 is None:
+        raise HTTPException(status_code=500, detail="Falta dependencia web3 (pip install web3)")
+    w3 = Web3(Web3.HTTPProvider(HYPER_RPC_URL, request_kwargs={"timeout": 8}))
+    if not w3.is_connected():
+        raise HTTPException(status_code=502, detail="No conecta al RPC de HyperEVM")
+    c = w3.eth.contract(address=LL_CONTRACT_ADDR, abi=_LL_ABI)
+    return w3, c
+
+def _pick_tokens_shape(j) -> List[dict]:
+    # normaliza formatos de api.liqd.ag
+    if isinstance(j, list):
+        return j
+    if isinstance(j, dict):
+        d = j.get("data") or {}
+        if isinstance(d.get("tokens"), list):
+            return d["tokens"]
+        if isinstance(d.get("addresses"), list):
+            return [{"address": a} for a in d["addresses"]]
+        if isinstance(j.get("tokens"), list):
+            return j["tokens"]
+    return []
+
+def _created_ms(meta) -> int:
+    ts = meta.get("creationTimestamp", 0)
+    try:
+        ts = int(ts)
+    except Exception:
+        ts = 0
+    # viene en segundos -> ms
+    return ts * 1000 if ts < 10**12 else ts
+
+@app.get("/liqd/recent_unbonded")
+def liqd_recent_unbonded(limit: int = 24):
+    """
+    Devuelve hasta 'limit' tokens que:
+      - existen en LiquidLaunch (getTokenMetadata no revierte)
+      - NO están bonded (getTokenBondingStatus.isBonded == false)
+    Ordenados del más nuevo (creationTimestamp) al más viejo.
+    """
+    # 1) Traemos semilla desde tu propio proxy si ya lo tenés, o directo si funciona
+    seeds = []
+    try:
+      # intenta tu endpoint proxy primero (si lo tenés implementado)
+      import requests
+      r = requests.get(f"{os.getenv('PUBLIC_BASE_URL','https://api.liqd.ag')}/tokens?limit={limit*4}&metadata=true", timeout=6)
+      if r.ok:
+          seeds = _pick_tokens_shape(r.json())
+    except Exception:
+      seeds = []
+
+    if not seeds:
+        # si no hubo suerte, devolvemos vacío (frente estable) en vez de error
+        return {"tokens": [], "count": 0}
+
+    # 2) Lecturas on-chain
+    try:
+        w3, c = _w3_and_contract()
+    except HTTPException as e:
+        # no cortamos todo; devolvemos “unknown” claro
+        return {"tokens": [], "count": 0, "error": e.detail}
+
+    out = []
+    for t in seeds:
+        addr = (t.get("address") or t.get("token") or t.get("contract") or "").strip()
+        if not addr:
+            continue
+        try:
+            addr = Web3.to_checksum_address(addr)
+        except Exception:
+            continue
+
+        # a) Confirma que sea token de LiquidLaunch (si revierte, no es)
+        try:
+            meta_tuple = c.functions.getTokenMetadata(addr).call()
+            # reempaquetar en dict legible
+            meta = {
+              "name": meta_tuple[0], "symbol": meta_tuple[1],
+              "image_uri": meta_tuple[2], "description": meta_tuple[3],
+              "website": meta_tuple[4], "twitter": meta_tuple[5],
+              "telegram": meta_tuple[6], "discord": meta_tuple[7],
+              "creator": meta_tuple[8], "creationTimestamp": int(meta_tuple[9]),
+              "startingLiquidity": int(meta_tuple[10]), "dexIndex": int(meta_tuple[11])
+            }
+        except ContractLogicError:
+            # no es de LiquidLaunch -> skip
+            continue
+        except Exception:
+            # cualquier otra falla (rpc, timeout) lo salteamos para no frenar todo
+            continue
+
+        # b) Estado de bonding
+        try:
+            _tAddr, isBonded, _bondTs = c.functions.getTokenBondingStatus(addr).call()
+            if isBonded:
+                continue  # queremos sólo NO bonded
+        except Exception:
+            continue
+
+        out.append({
+            "address": addr,
+            "name": meta["name"],
+            "symbol": meta["symbol"],
+            "creationTimestamp": meta["creationTimestamp"],
+            "dexIndex": meta["dexIndex"]
+        })
+
+        if len(out) >= limit:
+            break
+
+    # 3) ordenar del más nuevo al más viejo
+    out.sort(key=lambda x: _created_ms(x), reverse=True)
+    return {"tokens": out, "count": len(out)}
