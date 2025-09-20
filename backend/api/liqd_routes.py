@@ -365,3 +365,69 @@ def liqd_recent_tokens_rpc(
 
     # ya vienen en orden descendente por creationTimestamp
     return JSONResponse({"tokens": out, "count": len(out)}, status_code=200)
+
+@router.get("/liqd/_ll_debug")
+def liqd_ll_debug(page_size: int = 50):
+    """
+    Debug del contrato LiquidLaunch:
+      - chainId y blockNumber
+      - getTokenCount()
+      - muestra hasta page_size últimas direcciones + bondedStatus (no filtra)
+    """
+    try:
+        w3, c = get_contract()
+    except Exception as e:
+        from fastapi import HTTPException
+        if isinstance(e, HTTPException):
+            return {"ok": False, "error": e.detail}
+        return {"ok": False, "error": str(e)}
+
+    info = {"ok": True, "rpc": str(w3.provider.endpoint_uri)}
+    try:
+        info["chainId"] = int(w3.eth.chain_id)
+    except Exception as e:
+        info["chainId_error"] = str(e)
+    try:
+        info["blockNumber"] = int(w3.eth.block_number)
+    except Exception as e:
+        info["blockNumber_error"] = str(e)
+
+    try:
+        total = int(c.functions.getTokenCount().call())
+        info["tokenCount"] = total
+    except Exception as e:
+        info["tokenCount_error"] = str(e)
+        return info
+
+    if total <= 0:
+        info["sample"] = []
+        return info
+
+    start = max(0, total - page_size)
+    size  = total - start
+    sample = []
+    try:
+        addrs, metas = c.functions.getPaginatedTokensWithMetadata(start, size).call()
+        for i in reversed(range(len(addrs))):
+            a = addrs[i]
+            try:
+                _a, isBonded, ts = c.functions.getTokenBondingStatus(a).call()
+            except Exception:
+                isBonded, ts = None, None
+            # mostramos name/symbol por si ayuda
+            m = metas[i]
+            sample.append({
+                "address": a,
+                "name": m[0],
+                "symbol": m[1],
+                "creationTimestamp": int(m[9]) if str(m[9]).isdigit() else m[9],
+                "isBonded": isBonded,
+                "bondedTimestamp": int(ts) if (ts is not None and str(ts).isdigit()) else ts,
+            })
+    except Exception as e:
+        info["sample_error"] = str(e)
+        sample = []
+
+    info["sample_size"] = len(sample)
+    info["sample"] = sample[: min(len(sample), 10)]
+    return info
