@@ -5,7 +5,7 @@ from typing import List
 import os
 import httpx
 
-from .rpc_util import get_contract, created_ms
+from .rpc_util import get_contract, created_ms  # usa tu util existente
 
 router = APIRouter()
 
@@ -20,7 +20,7 @@ def liqd_recent_proxy(
     search: str | None = Query(default=None),
 ):
     """
-    Proxy de la token-list de LIQD.
+    Proxy de la token-list de LIQD (docs: /liquidswap-integration/token-list).
     Devuelve {"tokens":[...]} o {"tokens":[],"error":"..."} (status 200).
     """
     params = {"limit": str(limit), "metadata": "true" if metadata else "false"}
@@ -29,8 +29,8 @@ def liqd_recent_proxy(
 
     urls = []
     if LIQD_WORKER_URL:
-        urls.append(LIQD_WORKER_URL)
-    urls.append("https://api.liqd.ag/tokens")
+        urls.append(LIQD_WORKER_URL)        # relay (si tenés CF Worker/Vercel)
+    urls.append("https://api.liqd.ag/tokens")  # directo
 
     last_err = "unknown"
     for u in urls:
@@ -65,18 +65,19 @@ def liqd_recent_proxy(
 @router.get("/liqd/recent_unbonded_chain")
 def liqd_recent_unbonded_chain(
     limit: int = Query(24, ge=1, le=200),
-    page_size: int = Query(100, ge=10, le=100),
+    page_size: int = Query(100, ge=10, le=500),
 ):
     """
-    On-chain puro:
+    On-chain puro contra LiquidLaunch:
       - getTokenCount()
-      - getPaginatedTokensWithMetadata() y recorre hacia atrás,
-      - getTokenBondingStatus(token).isBonded == false,
-      - ordena por creationTimestamp desc.
+      - getPaginatedTokensWithMetadata() (vamos de atrás hacia adelante)
+      - getTokenBondingStatus(token).isBonded == false
+      - orden por creationTimestamp desc.
     """
     try:
         w3, c = get_contract()
     except Exception as e:
+        # get_contract ya puede lanzar HTTPException; normalizamos a JSON 200
         from fastapi import HTTPException
         if isinstance(e, HTTPException):
             return JSONResponse({"tokens": [], "count": 0, "error": e.detail}, status_code=200)
@@ -87,18 +88,20 @@ def liqd_recent_unbonded_chain(
     except Exception as e:
         return JSONResponse({"tokens": [], "count": 0, "error": f"getTokenCount: {e}"}, status_code=200)
 
-    out = []
+    out: List[dict] = []
     remaining = limit
+
     while remaining > 0 and total > 0:
         start = max(0, total - page_size)
-        size = min(page_size, total - start)  # <= importante
+        size = total - start
         try:
-            tokens, metas = c.functions.getPaginatedTokensWithMetadata(start, size).call()
+            addrs, metas = c.functions.getPaginatedTokensWithMetadata(start, size).call()
         except Exception:
             break
 
-        for i in reversed(range(len(tokens))):
-            addr = tokens[i]
+        # iteramos del más nuevo al más viejo dentro del bloque
+        for i in reversed(range(len(addrs))):
+            addr = addrs[i]
             meta = metas[i]
             try:
                 _t, isBonded, _ts = c.functions.getTokenBondingStatus(addr).call()
@@ -117,7 +120,7 @@ def liqd_recent_unbonded_chain(
             if remaining <= 0:
                 break
 
-        total = start
+        total = start  # pasamos al bloque anterior
 
     out.sort(key=created_ms, reverse=True)
     return JSONResponse({"tokens": out, "count": len(out)}, status_code=200)
@@ -126,10 +129,10 @@ def liqd_recent_unbonded_chain(
 @router.get("/liqd/recent_unbonded")
 def liqd_recent_unbonded(limit: int = Query(24, ge=1, le=200)):
     """
-    Semilla LIQD (o Worker) + validación on-chain:
-      - getTokenMetadata(token) confirma que es de LiquidLaunch.
+    Semilla LIQD (token-list) + verificación on-chain:
+      - getTokenMetadata(token) confirma que pertenece al Launch.
       - getTokenBondingStatus(token).isBonded == false
-      - Orden por creationTimestamp desc.
+      - orden por creationTimestamp desc.
     """
     # 1) Semilla
     seeds: List[dict] = []
@@ -177,11 +180,13 @@ def liqd_recent_unbonded(limit: int = Query(24, ge=1, le=200)):
         except Exception:
             a = addr
 
+        # Confirmar contrato del Launch
         try:
             meta = c.functions.getTokenMetadata(a).call()
         except Exception:
             continue
 
+        # Unbonded
         try:
             _ta, isBonded, _bt = c.functions.getTokenBondingStatus(a).call()
             if isBonded:
@@ -193,7 +198,7 @@ def liqd_recent_unbonded(limit: int = Query(24, ge=1, le=200)):
             "address": a,
             "name": meta[0],
             "symbol": meta[1],
-            "creationTimestamp": int(meta[9])
+            "creationTimestamp": int(meta[9])  # seconds
         })
         if len(out) >= limit:
             break
@@ -205,10 +210,10 @@ def liqd_recent_unbonded(limit: int = Query(24, ge=1, le=200)):
 @router.get("/liqd/recent_frozen")
 def liqd_recent_frozen(
     limit: int = Query(24, ge=1, le=200),
-    page_size: int = Query(100, ge=10, le=100),  # <= acotado
+    page_size: int = Query(200, ge=10, le=1000),
 ):
     """
-    Tokens LiquidLaunch con isFrozen=true (listos para migrar).
+    Tokens LiquidLaunch con isFrozen=true (listos para migrar/habilitar pool).
     """
     try:
         w3, c = get_contract()
@@ -227,15 +232,15 @@ def liqd_recent_frozen(
         return JSONResponse({"tokens": [], "count": 0}, status_code=200)
 
     start = max(0, total - page_size)
-    size  = min(page_size, total - start)  # <= importante
+    size  = total - start
     try:
-        tokens, metas = c.functions.getPaginatedTokensWithMetadata(start, size).call()
+        addrs, metas = c.functions.getPaginatedTokensWithMetadata(start, size).call()
     except Exception as e:
         return JSONResponse({"tokens": [], "count": 0, "error": f"getPaginated: {e}"}, status_code=200)
 
     out: List[dict] = []
-    for i in reversed(range(len(tokens))):
-        addr = tokens[i]
+    for i in reversed(range(len(addrs))):
+        addr = addrs[i]
         meta = metas[i]
         try:
             _a, isFrozen, fts = c.functions.getTokenFrozenStatus(addr).call()
@@ -295,12 +300,13 @@ def liqd_rpc_health():
 def liqd_recent_tokens_rpc(
     limit: int = Query(30, ge=1, le=200),
     bonded: str = Query("both", pattern="^(both|unbonded|bonded)$"),
-    page_size: int = Query(100, ge=50, le=100),  # MAX 100
+    page_size: int = Query(100, ge=50, le=100),  # contrato limita a 100 por llamada
 ):
     """
-    Lista recientes directo por RPC; bonded: both|unbonded|bonded
+    Trae la última página del contrato (hasta 100), y aplica filtro:
+      bonded = both | bonded | unbonded
+    Devuelve {"tokens":[...], "count":N, "pageInfo":{...}}
     """
-    # conectar contrato
     try:
         w3, c = get_contract()
     except Exception as e:
@@ -309,16 +315,14 @@ def liqd_recent_tokens_rpc(
             return JSONResponse({"tokens": [], "count": 0, "error": e.detail}, status_code=200)
         return JSONResponse({"tokens": [], "count": 0, "error": str(e)}, status_code=200)
 
-    # total
     try:
         total = int(c.functions.getTokenCount().call())
     except Exception as e:
         return JSONResponse({"tokens": [], "count": 0, "error": f"getTokenCount: {e}"}, status_code=200)
 
     if total <= 0:
-        return JSONResponse({"tokens": [], "count": 0}, status_code=200)
+        return JSONResponse({"tokens": [], "count": 0, "pageInfo": {"total": 0, "start": 0, "size": 0, "returned": 0}}, status_code=200)
 
-    # bloque desde el final
     start = max(0, total - page_size)
     size  = min(page_size, total - start)
     try:
@@ -334,9 +338,9 @@ def liqd_recent_tokens_rpc(
             "hint": "reduce page_size (max 100) o intenta otra página"
         }, status_code=200)
 
-    out = []
     want_bonded = bonded != "unbonded"
     want_unbonded = bonded != "bonded"
+    out: List[dict] = []
 
     for i in reversed(range(len(addrs))):
         addr = addrs[i]
@@ -410,7 +414,7 @@ def liqd_ll_debug(page_size: int = 50):
         return info
 
     start = max(0, total - page_size)
-    size  = min(page_size, total - start)
+    size  = total - start
     sample = []
     try:
         addrs, metas = c.functions.getPaginatedTokensWithMetadata(start, size).call()
