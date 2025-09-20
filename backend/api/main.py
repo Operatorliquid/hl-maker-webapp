@@ -30,18 +30,35 @@ app = FastAPI(title="hl-maker-webapi", version="0.6")
 app.include_router(liqd_router, prefix="")
 
 # ---- CORS
-ALLOW_ORIGINS = (os.getenv("ALLOW_ORIGINS") or "*").split(",")
+raw_origins = (os.getenv("ALLOW_ORIGINS") or "").strip()
+if not raw_origins:
+    # por defecto, tus dominios + localhost
+    allow_origins = [
+        "https://operatorliquid.com",
+        "https://www.operatorliquid.com",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+    allow_credentials = True
+else:
+    parts = [o.strip() for o in raw_origins.split(",") if o.strip()]
+    if parts == ["*"]:
+        # wildcard PERMITIDO solo si NO usamos credenciales
+        allow_origins = ["*"]
+        allow_credentials = False
+    else:
+        allow_origins = parts
+        allow_credentials = True
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOW_ORIGINS if o.strip()],
-    allow_credentials=True,
+    allow_origins=allow_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"],  # Authorization, Content-Type, etc.
 )
 
-@app.options("/{rest_of_path:path}")
-def options_catch_all(rest_of_path: str):
-    return Response(status_code=204)
+
 
 # Limpia pidfiles de bots muertos al levantar el server
 pidguard.cleanup_dead()
