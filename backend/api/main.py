@@ -1,19 +1,15 @@
-
-
-
 # backend/api/main.py
-from fastapi import Request
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header
+from fastapi import Request, FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
-from typing import Optional, Dict
+from typing import Optional, Dict, List
+from pathlib import Path
 import os, uuid, time
 
 from api import pidguard
 
 # cargar .env
-from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
 
@@ -27,16 +23,15 @@ from eth_account.messages import encode_defunct
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 
-import os
+# HTTP cliente
 import httpx
-from fastapi import Query
-from fastapi.responses import JSONResponse
 
-LIQD_WORKER_URL = os.getenv("LIQD_WORKER_URL", "").strip()
+# --------------------------------------------------------------------
+# Config opcional para el relay de LIQD (Cloudflare Worker / Vercel)
+# --------------------------------------------------------------------
+LIQD_WORKER_URL = (os.getenv("LIQD_WORKER_URL") or "").strip()
 
 app = FastAPI(title="hl-maker-webapi", version="0.6")
-
-
 
 # ---- CORS
 ALLOW_ORIGINS = (os.getenv("ALLOW_ORIGINS") or "*").split(",")
@@ -208,18 +203,15 @@ def start_bot(req: StartReq, authorization: str = Header(default="")):
         registry.start(key, cfg, args)
         return {"ok": True, "using_agent": bool(cfg.use_agent), "key": key, "owner": owner_addr}
     except HTTPException:
-        # Dejá que FastAPI devuelva el 4xx con su detalle
         raise
     except Exception as e:
-        import logging, traceback
+        import logging
         logging.exception("start_bot failed")
-        # Devolvemos 400 con el texto del error para debug rápido
         return Response(
             content=f'{{"ok":false,"error":"{type(e).__name__}: {str(e)}"}}',
             media_type="application/json",
             status_code=400
         )
-
 
 @app.post("/bot/stop")
 def stop_bot(authorization: str = Header(default="")):
@@ -265,7 +257,6 @@ def stop_all():
 def status(authorization: str = Header(default="")):
     key = _reg_key_from_auth(authorization)
     br = registry.get(key)
-    # ANTES: p = getattr(getattr(br, "state", None), "proc", None) if br else None
     p = getattr(br, "proc", None) if br else None
     running = bool(p and p.is_alive())
     pid = getattr(p, "pid", None)
@@ -277,11 +268,6 @@ def bot_debug(authorization: str = Header(default="")):
     import psutil  # ya lo tenés instalado
     key = _reg_key_from_auth(authorization)
     br = registry.get(key)
-
-    # ANTES:
-    # state = getattr(br, "state", None) if br else None
-    # p = getattr(state, "proc", None) if state else None
-    # pid = getattr(p, "pid", None)
 
     p = getattr(br, "proc", None) if br else None
     pid = getattr(p, "pid", None)
@@ -309,7 +295,6 @@ def bot_debug(authorization: str = Header(default="")):
         "last_beat": getattr(br, "last_beat", None) if br else None,
         "logs": last_logs,
     }
-
 
 # ---- WS logs (token por query para multiusuario)
 @app.websocket("/ws/logs")
@@ -365,7 +350,9 @@ def spot_meta():
             continue
     return {"ok": True, "meta": out}
 
-# === LIQD token list proxy (HTTP/2 + headers tipo navegador + fallbacks) ===
+# ====================================================================
+# === LIQD token list proxy (usa Worker si está configurado) =========
+# ====================================================================
 @app.get("/liqd/recent_proxy")
 def liqd_recent_proxy(
     limit: int = Query(24, ge=1, le=200),
@@ -373,46 +360,69 @@ def liqd_recent_proxy(
     search: str | None = Query(default=None),
 ):
     """
-    Llama al Cloudflare Worker (relay) que a su vez consulta https://api.liqd.ag/tokens.
-    Devuelve siempre {"tokens":[...]} o {"tokens":[],"error":"..."} (status 200).
+    Pide tokens a LIQD:
+      - Si LIQD_WORKER_URL está seteado, usamos ese relay (recomendado).
+      - Si no, intentamos directo a https://api.liqd.ag/tokens
+    Devuelve {"tokens":[...]} o {"tokens":[],"error":"..."} (status 200).
     """
-    if not LIQD_WORKER_URL:
-        return JSONResponse(content={"tokens": [], "error": "worker_url_not_set"}, status_code=200)
-
     params = {"limit": str(limit), "metadata": "true" if metadata else "false"}
     if search:
         params["search"] = search
 
-    try:
-      with httpx.Client(timeout=8.0) as client:
-          r = client.get(LIQD_WORKER_URL, params=params)
-          r.raise_for_status()
-          data = r.json()
-          tokens = data.get("tokens") if isinstance(data, dict) else []
-          if isinstance(tokens, list) and tokens:
-              return JSONResponse(content={"tokens": tokens})
-          return JSONResponse(content={"tokens": [], "error": data.get("error", "empty")}, status_code=200)
-    except Exception as e:
-      return JSONResponse(content={"tokens": [], "error": str(e)}, status_code=200)
+    urls = []
+    if LIQD_WORKER_URL:
+        urls.append(LIQD_WORKER_URL)  # relay
+    urls.append("https://api.liqd.ag/tokens")  # directo
 
-      # === LIQD: recent unbonded (LiquidLaunch-only) ==============================
-from typing import List
-import json
-from functools import lru_cache
+    last_err = "unknown"
+    for u in urls:
+        try:
+            with httpx.Client(timeout=8.0) as client:
+                r = client.get(u, params=params)
+                if r.status_code != 200:
+                    last_err = f"upstream_{r.status_code}"
+                    continue
+                data = r.json()
+                tokens = []
+                if isinstance(data, list):
+                    tokens = data
+                elif isinstance(data, dict):
+                    if isinstance(data.get("tokens"), list):
+                        tokens = data["tokens"]
+                    elif isinstance(data.get("data"), dict):
+                        dd = data["data"]
+                        if isinstance(dd.get("tokens"), list):
+                            tokens = dd["tokens"]
+                        elif isinstance(dd.get("addresses"), list):
+                            tokens = [{"address": a} for a in dd["addresses"]]
+                if tokens:
+                    return JSONResponse({"tokens": tokens})
+                last_err = "empty"
+        except Exception as e:
+            last_err = str(e)
 
-# Web3 para leer estado en HyperEVM
+    return JSONResponse({"tokens": [], "error": last_err}, status_code=200)
+
+# ====================================================================
+# === LiquidLaunch: sólo tokens NO-bonded, orden reciente ============
+# ====================================================================
+# Web3 (opcionalmente configurable)
 try:
     from web3 import Web3
     from web3.exceptions import ContractLogicError
 except Exception:
-    Web3 = None  # si no está instalado, devolvemos un error amable más abajo
+    Web3 = None  # si no está instalado, devolvemos error amable
 
 HYPER_RPC_URL = os.getenv("HYPER_RPC_URL", "https://rpc.hyperliquid.xyz/evm")
-LL_CONTRACT_ADDR = Web3.to_checksum_address("0xDEC3540f5BA6f2aa3764583A9c29501FeB020030") if Web3 else "0xDEC3540f5BA6f2aa3764583A9c29501FeB020030"
+LL_ADDRESS_RAW = "0xDEC3540f5BA6f2aa3764583A9c29501FeB020030"
+LL_CONTRACT_ADDR = None
+if Web3 is not None:
+    try:
+        LL_CONTRACT_ADDR = Web3.to_checksum_address(LL_ADDRESS_RAW)
+    except Exception:
+        LL_CONTRACT_ADDR = LL_ADDRESS_RAW
 
-# ABI mínimo: sólo lo que usamos
-_LL_ABI = json.loads("""
-[
+_LL_ABI = [
   {
     "inputs":[{"internalType":"address","name":"token","type":"address"}],
     "name":"getTokenBondingStatus",
@@ -448,17 +458,6 @@ _LL_ABI = json.loads("""
     "stateMutability":"view","type":"function"
   }
 ]
-""")
-
-@lru_cache(maxsize=1)
-def _w3_and_contract():
-    if Web3 is None:
-        raise HTTPException(status_code=500, detail="Falta dependencia web3 (pip install web3)")
-    w3 = Web3(Web3.HTTPProvider(HYPER_RPC_URL, request_kwargs={"timeout": 8}))
-    if not w3.is_connected():
-        raise HTTPException(status_code=502, detail="No conecta al RPC de HyperEVM")
-    c = w3.eth.contract(address=LL_CONTRACT_ADDR, abi=_LL_ABI)
-    return w3, c
 
 def _pick_tokens_shape(j) -> List[dict]:
     # normaliza formatos de api.liqd.ag
@@ -474,93 +473,93 @@ def _pick_tokens_shape(j) -> List[dict]:
             return j["tokens"]
     return []
 
-def _created_ms(meta) -> int:
-    ts = meta.get("creationTimestamp", 0)
+def _created_ms(item: dict) -> int:
+    v = item.get("creationTimestamp") or item.get("created_at") or item.get("createdAt")
+    if v is None:
+        return 0
     try:
-        ts = int(ts)
+        n = int(v)
+        return n if n > 10**12 else n * 1000
     except Exception:
-        ts = 0
-    # viene en segundos -> ms
-    return ts * 1000 if ts < 10**12 else ts
+        try:
+            from datetime import datetime
+            return int(datetime.fromisoformat(str(v).replace("Z","")).timestamp() * 1000)
+        except Exception:
+            return 0
+
+from functools import lru_cache
+
+@lru_cache(maxsize=1)
+def _w3_and_contract():
+    if Web3 is None:
+        raise HTTPException(status_code=500, detail="web3 no instalado (pip install web3)")
+    w3 = Web3(Web3.HTTPProvider(HYPER_RPC_URL, request_kwargs={"timeout": 8}))
+    if not w3.is_connected():
+        raise HTTPException(status_code=502, detail="RPC HyperEVM no disponible")
+    c = w3.eth.contract(address=LL_CONTRACT_ADDR or LL_ADDRESS_RAW, abi=_LL_ABI)
+    return w3, c
 
 @app.get("/liqd/recent_unbonded")
-def liqd_recent_unbonded(limit: int = 24):
+def liqd_recent_unbonded(limit: int = Query(24, ge=1, le=200)):
     """
-    Devuelve hasta 'limit' tokens que:
-      - existen en LiquidLaunch (getTokenMetadata no revierte)
-      - NO están bonded (getTokenBondingStatus.isBonded == false)
-    Ordenados del más nuevo (creationTimestamp) al más viejo.
+    Devuelve hasta 'limit' tokens creados en LiquidLaunch y NO bonded,
+    ordenados del más nuevo al más viejo (creationTimestamp).
     """
-    # 1) Traemos semilla desde tu propio proxy si ya lo tenés, o directo si funciona
-    seeds = []
-    try:
-      # intenta tu endpoint proxy primero (si lo tenés implementado)
-      import requests
-      r = requests.get(f"{os.getenv('PUBLIC_BASE_URL','https://api.liqd.ag')}/tokens?limit={limit*4}&metadata=true", timeout=6)
-      if r.ok:
-          seeds = _pick_tokens_shape(r.json())
-    except Exception:
-      seeds = []
+    # 1) Semilla desde LIQD (usa Worker si está seteado; si no, directo)
+    seeds: List[dict] = []
+    for u in filter(None, [LIQD_WORKER_URL, "https://api.liqd.ag/tokens"]):
+        try:
+            with httpx.Client(timeout=8.0) as client:
+                r = client.get(u, params={"limit": str(limit * 5), "metadata": "true"})
+                if r.status_code == 200:
+                    seeds = _pick_tokens_shape(r.json())
+                    if seeds:
+                        break
+        except Exception:
+            continue
 
     if not seeds:
-        # si no hubo suerte, devolvemos vacío (frente estable) en vez de error
-        return {"tokens": [], "count": 0}
+        return JSONResponse({"tokens": [], "count": 0, "error": "seed_empty"}, status_code=200)
 
-    # 2) Lecturas on-chain
+    # 2) Filtrado on-chain: LiquidLaunch + no bonded
     try:
         w3, c = _w3_and_contract()
     except HTTPException as e:
-        # no cortamos todo; devolvemos “unknown” claro
-        return {"tokens": [], "count": 0, "error": e.detail}
+        return JSONResponse({"tokens": [], "count": 0, "error": e.detail}, status_code=200)
 
-    out = []
+    out: List[dict] = []
     for t in seeds:
         addr = (t.get("address") or t.get("token") or t.get("contract") or "").strip()
         if not addr:
             continue
         try:
-            addr = Web3.to_checksum_address(addr)
+            a = Web3.to_checksum_address(addr) if Web3 is not None else addr
         except Exception:
             continue
 
-        # a) Confirma que sea token de LiquidLaunch (si revierte, no es)
+        # a) Confirma que es de LiquidLaunch (si revierte, no fue creado allí)
         try:
-            meta_tuple = c.functions.getTokenMetadata(addr).call()
-            # reempaquetar en dict legible
-            meta = {
-              "name": meta_tuple[0], "symbol": meta_tuple[1],
-              "image_uri": meta_tuple[2], "description": meta_tuple[3],
-              "website": meta_tuple[4], "twitter": meta_tuple[5],
-              "telegram": meta_tuple[6], "discord": meta_tuple[7],
-              "creator": meta_tuple[8], "creationTimestamp": int(meta_tuple[9]),
-              "startingLiquidity": int(meta_tuple[10]), "dexIndex": int(meta_tuple[11])
-            }
-        except ContractLogicError:
-            # no es de LiquidLaunch -> skip
-            continue
+            meta = c.functions.getTokenMetadata(a).call()
         except Exception:
-            # cualquier otra falla (rpc, timeout) lo salteamos para no frenar todo
+            # si revierte o falla el RPC, lo saltamos
             continue
 
-        # b) Estado de bonding
+        # b) Estado bonding: debe ser NOT bonded
         try:
-            _tAddr, isBonded, _bondTs = c.functions.getTokenBondingStatus(addr).call()
+            _ta, isBonded, _bt = c.functions.getTokenBondingStatus(a).call()
             if isBonded:
-                continue  # queremos sólo NO bonded
+                continue
         except Exception:
             continue
 
         out.append({
-            "address": addr,
-            "name": meta["name"],
-            "symbol": meta["symbol"],
-            "creationTimestamp": meta["creationTimestamp"],
-            "dexIndex": meta["dexIndex"]
+            "address": a,
+            "name": meta[0],
+            "symbol": meta[1],
+            "creationTimestamp": int(meta[9])  # seconds
         })
-
         if len(out) >= limit:
             break
 
-    # 3) ordenar del más nuevo al más viejo
-    out.sort(key=lambda x: _created_ms(x), reverse=True)
-    return {"tokens": out, "count": len(out)}
+    out.sort(key=_created_ms, reverse=True)
+    return JSONResponse({"tokens": out, "count": len(out)}, status_code=200)
