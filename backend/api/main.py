@@ -1,7 +1,4 @@
-# NUEVO para el proxy LIQD:
-import httpx
-from fastapi import Query
-from fastapi.responses import JSONResponse
+
 
 
 # backend/api/main.py
@@ -30,7 +27,16 @@ from eth_account.messages import encode_defunct
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
 
+import os
+import httpx
+from fastapi import Query
+from fastapi.responses import JSONResponse
+
+LIQD_WORKER_URL = os.getenv("LIQD_WORKER_URL", "").strip()
+
 app = FastAPI(title="hl-maker-webapi", version="0.6")
+
+
 
 # ---- CORS
 ALLOW_ORIGINS = (os.getenv("ALLOW_ORIGINS") or "*").split(",")
@@ -367,88 +373,24 @@ def liqd_recent_proxy(
     search: str | None = Query(default=None),
 ):
     """
-    Proxy a https://api.liqd.ag/tokens según docs: {"success":true,"data":{"tokens":[...]}}
-    - Usa httpx con HTTP/2 y cabeceras de navegador (Origin/Referer de liquidscan.fun)
-    - Si 403: reintenta variando headers y HTTP/2 -> HTTP/1.1
-    - Siempre devuelve {"tokens":[...]} o {"tokens":[],"error":"..."} con 200
+    Llama al Cloudflare Worker (relay) que a su vez consulta https://api.liqd.ag/tokens.
+    Devuelve siempre {"tokens":[...]} o {"tokens":[],"error":"..."} (status 200).
     """
-    base_url = "https://api.liqd.ag/tokens"
+    if not LIQD_WORKER_URL:
+        return JSONResponse(content={"tokens": [], "error": "worker_url_not_set"}, status_code=200)
 
-    # Cabeceras "tipo navegador" (como verías en DevTools > Network)
-    headers_browser_like = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/126.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "es-419,es;q=0.9,en;q=0.8",
-        "Cache-Control": "no-cache",
-        # Muchos CDNs miran estos dos:
-        "Origin": "https://liquidscan.fun",
-        "Referer": "https://liquidscan.fun/recent",
-        "Connection": "keep-alive",
-    }
-
-    params = {
-        "limit": limit,
-        "metadata": "true" if metadata else "false",
-    }
+    params = {"limit": str(limit), "metadata": "true" if metadata else "false"}
     if search:
         params["search"] = search
 
-    # Estrategias de intento: combinamos HTTP/2 on/off y con/sin Origin/Referer
-    attempts = [
-        {"http2": True,  "with_ref": True},
-        {"http2": True,  "with_ref": False},
-        {"http2": False, "with_ref": True},
-        {"http2": False, "with_ref": False},
-    ]
-
-    last_err = "unknown"
-
-    for att in attempts:
-        http2 = att["http2"]
-        with_ref = att["with_ref"]
-        h = dict(headers_browser_like)
-        if not with_ref:
-            h.pop("Origin", None)
-            h.pop("Referer", None)
-
-        try:
-            # httpx con HTTP/2 y timeout razonable
-            with httpx.Client(http2=http2, timeout=8.0, headers=h) as client:
-                r = client.get(base_url, params=params)
-                # Si 403, probamos la siguiente estrategia
-                if r.status_code == 403:
-                    last_err = f"403 (http2={http2}, with_ref={with_ref})"
-                    continue
-                r.raise_for_status()
-
-                data = r.json()
-
-                # Parseo según docs: data.data.tokens (o addresses si metadata=false)
-                out = []
-                if isinstance(data, dict) and isinstance(data.get("data"), dict):
-                    inner = data["data"]
-                    if metadata:
-                        tokens = inner.get("tokens") or []
-                        if isinstance(tokens, list):
-                            out = tokens[:limit]
-                    else:
-                        addrs = inner.get("addresses") or []
-                        if isinstance(addrs, list):
-                            out = [{"address": a} for a in addrs[:limit]]
-
-                if out:
-                    return JSONResponse(content={"tokens": out})
-                else:
-                    last_err = f"empty_response (http2={http2}, with_ref={with_ref})"
-                    # seguimos probando otras combinaciones
-
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            # probamos próxima combinación
-
-    # Si ninguna estrategia funcionó, devolvemos JSON estable:
-    return JSONResponse(content={"tokens": [], "error": last_err}, status_code=200)
+    try:
+      with httpx.Client(timeout=8.0) as client:
+          r = client.get(LIQD_WORKER_URL, params=params)
+          r.raise_for_status()
+          data = r.json()
+          tokens = data.get("tokens") if isinstance(data, dict) else []
+          if isinstance(tokens, list) and tokens:
+              return JSONResponse(content={"tokens": tokens})
+          return JSONResponse(content={"tokens": [], "error": data.get("error", "empty")}, status_code=200)
+    except Exception as e:
+      return JSONResponse(content={"tokens": [], "error": str(e)}, status_code=200)
