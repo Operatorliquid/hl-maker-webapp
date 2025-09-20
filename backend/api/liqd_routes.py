@@ -63,8 +63,8 @@ def liqd_recent_proxy(
 
 @router.get("/liqd/recent_unbonded_chain")
 def liqd_recent_unbonded_chain(
-    limit: int = Query(24, ge=1, le=200),
-    page_size: int = Query(100, ge=10, le=500),
+    limit: int = Query(100, ge=10, le=100),
+    page_size: size = min(page_size, total - start),
 ):
     """
     On-chain puro:
@@ -294,25 +294,9 @@ def liqd_rpc_health():
 def liqd_recent_tokens_rpc(
     limit: int = Query(30, ge=1, le=200),
     bonded: str = Query("both", pattern="^(both|unbonded|bonded)$"),
-    page_size: int = Query(250, ge=50, le=1000),
+    page_size: int = Query(100, ge=50, le=100),  # <- MAX 100
 ):
-    """
-    Devuelve los últimos tokens de LiquidLaunch directamente por RPC.
-    Parámetros:
-      - limit: cantidad deseada.
-      - bonded: both | unbonded | bonded (filtra por getTokenBondingStatus).
-      - page_size: tamaño del bloque que se trae del final (para reducir llamadas).
-    Estructura: {"tokens":[{address,name,symbol,creationTimestamp,isBonded,bondedTimestamp}], "count": N}
-    """
-    try:
-        w3, c = get_contract()
-    except Exception as e:
-        from fastapi import HTTPException
-        if isinstance(e, HTTPException):
-            return JSONResponse({"tokens": [], "count": 0, "error": e.detail}, status_code=200)
-        return JSONResponse({"tokens": [], "count": 0, "error": str(e)}, status_code=200)
-
-    # 1) total
+    # ...
     try:
         total = int(c.functions.getTokenCount().call())
     except Exception as e:
@@ -321,32 +305,37 @@ def liqd_recent_tokens_rpc(
     if total <= 0:
         return JSONResponse({"tokens": [], "count": 0}, status_code=200)
 
-    # 2) Traer un bloque grande desde el final
     start = max(0, total - page_size)
-    size  = total - start
+    size  = min(page_size, total - start)  # <- no pasarse
     try:
-        tokens, metas = c.functions.getPaginatedTokensWithMetadata(start, size).call()
+        addrs, metas = c.functions.getPaginatedTokensWithMetadata(start, size).call()
     except Exception as e:
         return JSONResponse({"tokens": [], "count": 0, "error": f"getPaginated: {e}"}, status_code=200)
 
-    # 3) Recorremos de más nuevo a más viejo y aplicamos filtro bonded
+    # --- si el contrato devuelve vacío, devolvemos la info de página para debug
+    if not addrs:
+        return JSONResponse({
+            "tokens": [],
+            "count": 0,
+            "pageInfo": {"total": total, "start": start, "size": size, "returned": 0},
+            "hint": "reduce page_size (max 100) o intenta otra página"
+        }, status_code=200)
+
     out = []
     want_bonded = bonded != "unbonded"
     want_unbonded = bonded != "bonded"
 
-    for i in reversed(range(len(tokens))):
-        addr = tokens[i]
+    for i in reversed(range(len(addrs))):
+        addr = addrs[i]
         meta = metas[i]
         try:
             _a, isBonded, bts = c.functions.getTokenBondingStatus(addr).call()
         except Exception:
-            # si falla status, lo ignoramos para no romper toda la lista
             isBonded, bts = False, 0
 
         if (isBonded and not want_bonded) or ((not isBonded) and not want_unbonded):
             continue
 
-        # meta[0]=name, meta[1]=symbol, meta[9]=creationTimestamp (segundos)
         try:
             ct = int(meta[9]) if str(meta[9]).isdigit() else 0
         except Exception:
@@ -363,8 +352,11 @@ def liqd_recent_tokens_rpc(
         if len(out) >= limit:
             break
 
-    # ya vienen en orden descendente por creationTimestamp
-    return JSONResponse({"tokens": out, "count": len(out)}, status_code=200)
+    return JSONResponse({
+        "tokens": out,
+        "count": len(out),
+        "pageInfo": {"total": total, "start": start, "size": size, "returned": len(addrs)}
+    }, status_code=200)
 
 @router.get("/liqd/_ll_debug")
 def liqd_ll_debug(page_size: int = 50):
