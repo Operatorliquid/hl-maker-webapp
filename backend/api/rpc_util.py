@@ -27,7 +27,7 @@ async def recent_launch(
 ):
     """
     Intenta getPaginatedTokensWithMetadata; si falla el decode, fallback:
-    - lee eventos TokenCreated recientes
+    - lees eventos TokenCreated recientes
     - por cada address, llama a getTokenMetadata(token) + estados
     """
     w3, c = get_contract()
