@@ -464,3 +464,73 @@ def liqd_recent_tokens_worker(
             return JSONResponse({"tokens": [], "count": 0, "error": "worker_bad_shape"}, status_code=200)
     except Exception as e:
         return JSONResponse({"tokens": [], "count": 0, "error": str(e)}, status_code=200)
+
+@router.get("/liqd/recent_launch")
+def liqd_recent_launch(
+    limit: int = Query(30, ge=1, le=300),
+    page_size: int = Query(100, ge=50, le=100),  # el contrato devuelve máx 100
+):
+    """
+    Lista reciente del *contrato* LiquidLaunch (solo Launch), mezclando UNBONDED + BONDED.
+    Recorre páginas desde el final (más nuevos primero) hasta alcanzar `limit`.
+    Devuelve: {"tokens":[{ address, name, symbol, creationTimestamp, isBonded, bondedTimestamp }], "count":N}
+    """
+    try:
+        w3, c = get_contract()
+    except Exception as e:
+        from fastapi import HTTPException
+        if isinstance(e, HTTPException):
+            return JSONResponse({"tokens": [], "count": 0, "error": e.detail}, status_code=200)
+        return JSONResponse({"tokens": [], "count": 0, "error": str(e)}, status_code=200)
+
+    try:
+        total = int(c.functions.getTokenCount().call())
+    except Exception as e:
+        return JSONResponse({"tokens": [], "count": 0, "error": f"getTokenCount: {e}"}, status_code=200)
+
+    if total <= 0:
+        return JSONResponse({"tokens": [], "count": 0}, status_code=200)
+
+    out = []
+    remaining = limit
+    cursor = total
+    while remaining > 0 and cursor > 0:
+        start = max(0, cursor - page_size)
+        size = cursor - start
+        try:
+            addrs, metas = c.functions.getPaginatedTokensWithMetadata(start, size).call()
+        except Exception as e:
+            # si esta página falla, probamos la siguiente (más vieja)
+            cursor = start
+            continue
+
+        # iteramos del más nuevo al más viejo
+        for i in reversed(range(len(addrs))):
+            addr = addrs[i]
+            meta = metas[i]
+            try:
+                _a, isBonded, bts = c.functions.getTokenBondingStatus(addr).call()
+            except Exception:
+                isBonded, bts = False, 0
+            try:
+                ct = int(meta[9]) if str(meta[9]).isdigit() else 0
+            except Exception:
+                ct = 0
+
+            out.append({
+                "address": addr,
+                "name": meta[0],
+                "symbol": meta[1],
+                "creationTimestamp": ct,
+                "isBonded": bool(isBonded),
+                "bondedTimestamp": int(bts) if str(bts).isdigit() else 0,
+            })
+            remaining -= 1
+            if remaining <= 0:
+                break
+
+        cursor = start  # página anterior
+
+    # más nuevos primero
+    out.sort(key=lambda x: x.get("creationTimestamp", 0), reverse=True)
+    return JSONResponse({"tokens": out[:limit], "count": len(out[:limit])}, status_code=200)
