@@ -1,111 +1,88 @@
 # backend/api/rpc_util.py
-from fastapi import HTTPException
-from typing import List, Tuple
 import os
+from typing import Tuple, List
 
-try:
-    from web3 import Web3
-except Exception:
-    Web3 = None  # si web3 no está instalado, devolvemos error amable
+from web3 import Web3
+from web3.middleware import geth_poa_middleware
 
-# Pool de RPCs (ambos opcionales por ENV, con defaults públicos)
-_DEFAULT_RPC_POOL = [
-    (os.getenv("HYPER_RPC_URL") or "").strip(),   # tu preferido
-    "https://rpc.hyperliquid.xyz/evm",            # oficial
-    (os.getenv("HYPER_RPC_URL_2") or "").strip(), # alternativo
-    "https://hyperliquid.drpc.org",               # mirror público
+# Pool de RPCs (podés setear HYPER_RPC_URL / HYPER_RPC_URL_2)
+RPC_POOL: List[str] = [
+    (os.getenv("HYPER_RPC_URL") or "").strip(),
+    "https://rpc.hyperliquid.xyz/evm",
+    (os.getenv("HYPER_RPC_URL_2") or "").strip(),
+    "https://hyperliquid.drpc.org",
 ]
-HYPER_RPC_URLS = [u for u in _DEFAULT_RPC_POOL if u] or ["https://rpc.hyperliquid.xyz/evm"]
+RPC_POOL = [r for r in RPC_POOL if r]
 
-# Dirección del contrato LiquidLaunch (mainnet HyperEVM)
-LL_ADDRESS_RAW = "0xDEC3540f5BA6f2aa3764583A9c29501FeB020030"
-
-# ABI mínimo (getTokenCount, getPaginatedTokensWithMetadata, getTokenBondingStatus, getTokenMetadata, getTokenFrozenStatus)
-_LL_ABI_MIN = [
-  {"inputs":[],"name":"getTokenCount","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
-  {"inputs":[{"internalType":"uint256","name":"start","type":"uint256"},{"internalType":"uint256","name":"limit","type":"uint256"}],
-   "name":"getPaginatedTokensWithMetadata",
+LIQUIDLAUNCH_ADDR = Web3.to_checksum_address("0xDEC3540f5BA6f2aa3764583A9c29501FeB020030")  # docs
+# ABI mínima (funciones que usamos)
+LIQUIDLAUNCH_ABI = [
+  {"type":"function","name":"getTokenCount","inputs":[],"outputs":[{"name":"","type":"uint256"}],"stateMutability":"view"},
+  {"type":"function","name":"getPaginatedTokensWithMetadata","inputs":[{"name":"start","type":"uint256"},{"name":"limit","type":"uint256"}],
    "outputs":[
-     {"internalType":"address[]","name":"tokens","type":"address[]"},
-     {"components":[
-        {"internalType":"string","name":"name","type":"string"},
-        {"internalType":"string","name":"symbol","type":"string"},
-        {"internalType":"string","name":"image_uri","type":"string"},
-        {"internalType":"string","name":"description","type":"string"},
-        {"internalType":"string","name":"website","type":"string"},
-        {"internalType":"string","name":"twitter","type":"string"},
-        {"internalType":"string","name":"telegram","type":"string"},
-        {"internalType":"string","name":"discord","type":"string"},
-        {"internalType":"address","name":"creator","type":"address"},
-        {"internalType":"uint256","name":"creationTimestamp","type":"uint256"},
-        {"internalType":"uint256","name":"startingLiquidity","type":"uint256"},
-        {"internalType":"uint8","name":"dexIndex","type":"uint8"}
-     ],"internalType":"struct TokenMetadata[]","name":"metadata","type":"tuple[]"}
+     {"name":"tokens","type":"address[]"},
+     {"name":"metadata","type":"tuple[]","components":[
+        {"name":"name","type":"string"},
+        {"name":"symbol","type":"string"},
+        {"name":"image_uri","type":"string"},
+        {"name":"description","type":"string"},
+        {"name":"website","type":"string"},
+        {"name":"twitter","type":"string"},
+        {"name":"telegram","type":"string"},
+        {"name":"discord","type":"string"},
+        {"name":"creator","type":"address"},
+        {"name":"creationTimestamp","type":"uint256"},
+        {"name":"startingLiquidity","type":"uint256"},
+        {"name":"dexIndex","type":"uint8"}
+     ]}
    ],
-   "stateMutability":"view","type":"function"},
-  {"inputs":[{"internalType":"address","name":"token","type":"address"}],
-   "name":"getTokenBondingStatus",
+   "stateMutability":"view"
+  },
+  {"type":"function","name":"getTokenBondingStatus","inputs":[{"name":"token","type":"address"}],
    "outputs":[
-     {"internalType":"address","name":"tokenAddress","type":"address"},
-     {"internalType":"bool","name":"isBonded","type":"bool"},
-     {"internalType":"uint256","name":"bondedTimestamp","type":"uint256"}
-   ],
-   "stateMutability":"view","type":"function"},
-  {"inputs":[{"internalType":"address","name":"token","type":"address"}],
-   "name":"getTokenMetadata",
-   "outputs":[{"components":[
-        {"internalType":"string","name":"name","type":"string"},
-        {"internalType":"string","name":"symbol","type":"string"},
-        {"internalType":"string","name":"image_uri","type":"string"},
-        {"internalType":"string","name":"description","type":"string"},
-        {"internalType":"string","name":"website","type":"string"},
-        {"internalType":"string","name":"twitter","type":"string"},
-        {"internalType":"string","name":"telegram","type":"string"},
-        {"internalType":"string","name":"discord","type":"string"},
-        {"internalType":"address","name":"creator","type":"address"},
-        {"internalType":"uint256","name":"creationTimestamp","type":"uint256"},
-        {"internalType":"uint256","name":"startingLiquidity","type":"uint256"},
-        {"internalType":"uint8","name":"dexIndex","type":"uint8"}
-   ],"internalType":"struct TokenMetadata","name":"","type":"tuple"}],
-   "stateMutability":"view","type":"function"},
-  {"inputs":[{"internalType":"address","name":"token","type":"address"}],
-   "name":"getTokenFrozenStatus",
+     {"name":"tokenAddress","type":"address"},
+     {"name":"isBonded","type":"bool"},
+     {"name":"bondedTimestamp","type":"uint256"}
+   ],"stateMutability":"view"
+  },
+  {"type":"function","name":"getTokenFrozenStatus","inputs":[{"name":"token","type":"address"}],
    "outputs":[
-     {"internalType":"address","name":"tokenAddress","type":"address"},
-     {"internalType":"bool","name":"isFrozen","type":"bool"},
-     {"internalType":"uint256","name":"frozenTimestamp","type":"uint256"}
-   ],
-   "stateMutability":"view","type":"function"}
+     {"name":"tokenAddress","type":"address"},
+     {"name":"isFrozen","type":"bool"},
+     {"name":"frozenTimestamp","type":"uint256"}
+   ],"stateMutability":"view"
+  },
 ]
 
-def get_contract() -> Tuple["Web3", "Contract"]:
-    """
-    Devuelve (w3, contrato) probando cada RPC del pool. Timeout de 15s por RPC.
-    No pisa nada del bot. Levanta HTTP 502 si no se pudo conectar a ninguno.
-    """
-    if Web3 is None:
-        raise HTTPException(status_code=500, detail="web3 no instalado (pip install web3)")
-    last_err = None
-    # normalizamos checksum una vez
+def choose_w3(rpc: str) -> Web3:
+    w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 8}))
+    # HyperEVM puede requerir compatibilidad POA
     try:
-        ll_addr = Web3.to_checksum_address(LL_ADDRESS_RAW)
+        w3.middleware_onion.inject(geth_poa_middleware, layer=0)
     except Exception:
-        ll_addr = LL_ADDRESS_RAW
-    for rpc in HYPER_RPC_URLS:
+        pass
+    return w3
+
+def _first_w3() -> Web3:
+    last_err = None
+    for rpc in RPC_POOL:
         try:
-            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
-            if not w3.is_connected():
-                last_err = f"no_connect:{rpc}"
-                continue
-            c = w3.eth.contract(address=ll_addr, abi=_LL_ABI_MIN)
-            return w3, c
+            w3 = choose_w3(rpc)
+            if w3.is_connected():
+                return w3
         except Exception as e:
-            last_err = f"{type(e).__name__}@{rpc}: {e}"
-    raise HTTPException(status_code=502, detail=f"RPC HyperEVM no disponible ({last_err})")
+            last_err = e
+            continue
+    raise RuntimeError(f"No RPC reachable: {last_err or 'unknown'}")
+
+def get_contract() -> Tuple[Web3, any]:
+    w3 = _first_w3()
+    c = w3.eth.contract(address=LIQUIDLAUNCH_ADDR, abi=LIQUIDLAUNCH_ABI)
+    return w3, c
 
 def created_ms(item: dict) -> int:
     """
-    Normaliza timestamps (creationTimestamp/created_at/createdAt) a milisegundos.
+    Normaliza timestamps varios → milisegundos.
     """
     v = item.get("creationTimestamp") or item.get("created_at") or item.get("createdAt")
     if v is None:
