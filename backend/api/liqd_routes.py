@@ -440,3 +440,33 @@ def liqd_ll_debug(page_size: int = 50):
     info["sample_size"] = len(sample)
     info["sample"] = sample[: min(len(sample), 10)]
     return info
+
+@router.get("/liqd/recent_tokens_worker")
+def liqd_recent_tokens_worker(
+    limit: int = Query(30, ge=1, le=200),
+    bonded: str = Query("both", pattern="^(both|unbonded|bonded)$"),
+):
+    """
+    Proxy al Cloudflare Worker: /recent-tokens-rpc
+    Devuelve tal cual lo que responda el worker (status 200 siempre).
+    """
+    if not LIQD_WORKER_URL:
+        return JSONResponse({"tokens": [], "count": 0, "error": "worker_not_configured"}, status_code=200)
+
+    url = LIQD_WORKER_URL.rstrip("/") + "/recent-tokens-rpc"
+    params = {"limit": str(limit), "bonded": bonded}
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            r = client.get(url, params=params)
+            if r.status_code != 200:
+                return JSONResponse({"tokens": [], "count": 0, "error": f"worker_{r.status_code}"}, status_code=200)
+            data = r.json()
+            # Normalizamos a la forma estándar si hiciera falta:
+            if isinstance(data, dict) and "tokens" in data:
+                return JSONResponse(data, status_code=200)
+            # Si el worker devuelve array directo:
+            if isinstance(data, list):
+                return JSONResponse({"tokens": data, "count": len(data)}, status_code=200)
+            return JSONResponse({"tokens": [], "count": 0, "error": "worker_bad_shape"}, status_code=200)
+    except Exception as e:
+        return JSONResponse({"tokens": [], "count": 0, "error": str(e)}, status_code=200)
