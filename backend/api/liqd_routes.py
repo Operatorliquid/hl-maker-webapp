@@ -467,13 +467,13 @@ def liqd_recent_tokens_worker(
 
 @router.get("/liqd/recent_launch")
 def liqd_recent_launch(
-    limit: int = Query(30, ge=1, le=300),
-    page_size: int = Query(100, ge=50, le=100),  # el contrato devuelve máx 100
+    limit: int = Query(30, ge=1, le=200),
+    page_size: int = Query(100, ge=10, le=100),  # el contrato devuelve máx 100 por página
 ):
     """
-    Lista reciente del *contrato* LiquidLaunch (solo Launch), mezclando UNBONDED + BONDED.
-    Recorre páginas desde el final (más nuevos primero) hasta alcanzar `limit`.
-    Devuelve: {"tokens":[{ address, name, symbol, creationTimestamp, isBonded, bondedTimestamp }], "count":N}
+    Últimos tokens de LiquidLaunch (tanto BONDED como UNBONDED) directamente del contrato.
+    No usa api.liqd.ag. Ordena por creationTimestamp desc y corta en `limit`.
+    Devuelve: {"tokens":[{"address","name","symbol","creationTimestamp","isBonded","bondedTimestamp"}], "count":N, "pageInfo": {...}}
     """
     try:
         w3, c = get_contract()
@@ -489,22 +489,22 @@ def liqd_recent_launch(
         return JSONResponse({"tokens": [], "count": 0, "error": f"getTokenCount: {e}"}, status_code=200)
 
     if total <= 0:
-        return JSONResponse({"tokens": [], "count": 0}, status_code=200)
+        return JSONResponse({"tokens": [], "count": 0, "pageInfo": {"total": 0, "visited": 0}}, status_code=200)
 
     out = []
-    remaining = limit
+    visited = 0
+    # Vamos de la última página hacia atrás, hasta completar `limit` o quedarnos sin items
     cursor = total
-    while remaining > 0 and cursor > 0:
+    while len(out) < limit and cursor > 0:
         start = max(0, cursor - page_size)
-        size = cursor - start
+        size  = min(page_size, cursor - start)
         try:
             addrs, metas = c.functions.getPaginatedTokensWithMetadata(start, size).call()
         except Exception as e:
-            # si esta página falla, probamos la siguiente (más vieja)
-            cursor = start
-            continue
+            return JSONResponse({"tokens": [], "count": 0, "error": f"getPaginated: {e}"}, status_code=200)
 
-        # iteramos del más nuevo al más viejo
+        visited += len(addrs)
+        # Recorremos internos de más nuevo a más viejo
         for i in reversed(range(len(addrs))):
             addr = addrs[i]
             meta = metas[i]
@@ -512,6 +512,8 @@ def liqd_recent_launch(
                 _a, isBonded, bts = c.functions.getTokenBondingStatus(addr).call()
             except Exception:
                 isBonded, bts = False, 0
+
+            # meta[0]=name, meta[1]=symbol, meta[9]=creationTimestamp (segundos)
             try:
                 ct = int(meta[9]) if str(meta[9]).isdigit() else 0
             except Exception:
@@ -525,12 +527,15 @@ def liqd_recent_launch(
                 "isBonded": bool(isBonded),
                 "bondedTimestamp": int(bts) if str(bts).isdigit() else 0,
             })
-            remaining -= 1
-            if remaining <= 0:
+            if len(out) >= limit:
                 break
 
         cursor = start  # página anterior
 
-    # más nuevos primero
+    # Orden final por creationTimestamp desc
     out.sort(key=lambda x: x.get("creationTimestamp", 0), reverse=True)
-    return JSONResponse({"tokens": out[:limit], "count": len(out[:limit])}, status_code=200)
+    return JSONResponse({
+        "tokens": out,
+        "count": len(out),
+        "pageInfo": {"total": total, "visited": visited}
+    }, status_code=200)

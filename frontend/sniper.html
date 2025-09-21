@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>OperatorLiquid — Sniper</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+
+  <!-- Evitar flash: oculto hasta que carguen los CSS -->
+  <style>body.preload{visibility:hidden}</style>
+
+  <!-- estilos base + sniper con cache-busting -->
+  <link rel="stylesheet" href="./styles.css" data-autov>
+  <link rel="stylesheet" href="./sniper.css" data-autov>
+
+  <!-- Cache-busting: agrega ?v=<timestamp> a todo [data-autov] -->
+  <script>
+    (function(){
+      const v = Date.now();
+      // aplicar versión
+      document.querySelectorAll('link[data-autov]').forEach(el=>{
+        const href = el.getAttribute('href');
+        el.setAttribute('href', href + (href.includes('?')?'&':'?') + 'v=' + v);
+      });
+      document.querySelectorAll('script[data-autov]').forEach(el=>{
+        const src = el.getAttribute('src');
+        el.setAttribute('src', src + (src.includes('?')?'&':'?') + 'v=' + v);
+      });
+      // mostrar el body cuando terminen de cargar estilos
+      const links = Array.from(document.querySelectorAll('link[rel="stylesheet"]'));
+      let pending = links.length;
+      function done(){ pending = Math.max(0, pending-1); if(pending===0){ document.body.classList.remove('preload'); } }
+      if (pending===0) { document.body.classList.remove('preload'); }
+      else { links.forEach(l => { l.addEventListener('load', done); l.addEventListener('error', done); }); }
+    })();
+  </script>
+</head>
+<body class="preload">
+  <header class="topbar">
+    <div class="brand"><img src="./assets/logo.png" alt="OperatorLiquid" /></div>
+    <div class="wallet">
+      <!-- MISMA UX QUE HOME -->
+      <button class="btn btn-primary" id="btnConnectSniper">
+        <img id="mmIconSniper" src="assets/MetaMask-icon-fox.svg" class="mm-icon hidden" alt="MetaMask" />
+        <span id="walletLabelSniper">Connect Wallet</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <h3 style="margin-top:26px;">Recent Launches</h3>
+<div id="recentWrap">
+  <div class="recent-grid" id="recentSkeletons">
+    <div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div>
+    <div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div>
+  </div>
+  <div class="recent-grid" id="recentList" style="display:none;"></div>
+</div>
+
+  </main>
+
+  <footer class="foot">
+    <small>Backend: <code id="backendUrlSniper"></code></small>
+  </footer>
+
+  <!-- Side panel -->
+  <div id="sideBackdrop" class="backdrop"></div>
+  <aside id="sidePanel" class="side">
+    <div class="side-header">
+      <div class="side-title">
+        <img src="assets/MetaMask-icon-fox.svg" class="mm-icon" alt="">
+        <span id="panelWallet">0x…</span>
+      </div>
+      <button id="sideClose" class="icon-btn" type="button" aria-label="Close">×</button>
+    </div>
+    <div class="side-body">
+      <div class="kv">
+        <div class="k">ESTATUS</div>
+        <div class="v"><span id="panelStatus">—</span></div>
+      </div>
+
+      <div class="mt">
+        <button id="panelDisconnect" class="btn danger">Disconnect wallet</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- JS del sniper con cache-busting -->
+<script>
+  // Cache-busting SOLO para JS: inyecta sniper.js con ?v=<timestamp>
+  (function(){
+    var s = document.createElement('script');
+    s.src = './sniper.js?v=' + Date.now();
+    s.defer = true; // no bloquea el render
+    document.body.appendChild(s);
+  })();
+</script>
+
+</body>
+</html>

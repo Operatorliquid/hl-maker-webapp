@@ -1,0 +1,43 @@
+/* sniper.css - estilos puntuales para el panel sniper */
+.sniper-controls { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:12px; align-items:flex-end; }
+.sniper-controls label { display:flex; flex-direction:column; gap:6px; min-width:160px; }
+.sn-item { background: rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.06); padding:8px 10px; border-radius:10px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; gap:8px; }
+.sn-left { display:flex; gap:10px; align-items:center; }
+.sn-token { font-weight:600; color:#CFE8E2; }
+.sn-meta { color:var(--muted); font-size:12px; }
+.sn-actions { display:flex; gap:8px; }
+.btn.snipe { background: linear-gradient(90deg,#ff8a8a,#ff6b6b); color:#fff; border:0; padding:6px 10px; border-radius:8px; }
+
+/* ====== RECENT (shimmer) ====== */
+.recent-grid{
+  display:grid; grid-template-columns: repeat(auto-fill,minmax(230px,1fr));
+  gap:14px; margin-top:12px;
+}
+.card{
+  padding:12px; border-radius:12px;
+  background: rgba(255,255,255,0.05);
+  border:1px solid rgba(255,255,255,0.08);
+  display:flex; flex-direction:column; gap:8px;
+  min-height:116px;
+}
+.card .t{ font-weight:700; color:#CFE8E2; font-size:15px; }
+.card .s{ color:var(--muted); font-size:12px; }
+.card .addr{ font-family: ui-monospace,monospace; font-size:12px; opacity:.85; }
+.card .pill{
+  display:inline-block; font-size:11px; padding:3px 8px; border-radius:999px;
+  background: rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.1);
+}
+
+/* shimmer */
+.skel{
+  position:relative; overflow:hidden; border-radius:12px; height:116px;
+  background: linear-gradient(0deg, rgba(255,255,255,0.04), rgba(255,255,255,0.04));
+}
+.skel::after{
+  content:""; position:absolute; inset:0;
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.12) 50%, transparent 100%);
+  transform: translateX(-100%); animation: shimmer 1.2s infinite;
+}
+@keyframes shimmer{ 100%{ transform: translateX(100%);} }
+
+
