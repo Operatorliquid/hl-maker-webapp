@@ -1,159 +1,158 @@
 # backend/api/liqd_routes.py
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
-from typing import List, Literal, Optional
-from .rpc_util import get_contract, choose_w3, created_ms, RPC_POOL
+from typing import List, Literal
+
+# Import tardío para no crashear en import si falta web3
+from .rpc_util import get_contract, created_ms, recent_from_logs
 
 router = APIRouter()
 
-def ok(data: dict, status: int = 200) -> JSONResponse:
-    return JSONResponse(data, status_code=status)
+def _ok(data: dict, code: int = 200) -> JSONResponse:
+    return JSONResponse(data, status_code=code)
 
 @router.get("/liqd/rpc_health")
 async def rpc_health():
-    out = []
-    for rpc in RPC_POOL:
-        if not rpc: 
-            continue
-        w3 = choose_w3(rpc)
-        connected = False
-        block = None
-        try:
-            connected = bool(w3.is_connected())
-            if connected:
-                block = int(w3.eth.block_number)
-        except Exception:
-            connected = False
-        out.append({"rpc": rpc, "connected": connected, "blockNumber": block})
-    return ok({"rpcs": out})
+    try:
+        w3, _ = get_contract()
+        bn = int(w3.eth.block_number)
+        return _ok({"connected": True, "blockNumber": bn})
+    except Exception as e:
+        # 200 con error → el front no cae
+        return _ok({"connected": False, "error": str(e)})
 
-def _bonded_match(flag: bool, desired: str) -> bool:
-    # desired: 'unbonded' | 'bonded' | 'both'
-    if desired == "both":
-        return True
-    return (flag and desired == "bonded") or ((not flag) and desired == "unbonded")
+def _want(bonded_flag: bool, mode: str) -> bool:
+    if mode == "both": return True
+    return (bonded_flag and mode == "bonded") or ((not bonded_flag) and mode == "unbonded")
 
 @router.get("/liqd/recent_launch")
 async def recent_launch(
     limit: int = Query(30, ge=1, le=200),
-    bonded: Literal["unbonded", "bonded", "both"] = Query("unbonded"),
-    page_size: int = Query(100, ge=10, le=300)
+    bonded: Literal["unbonded","bonded","both"] = Query("unbonded"),
+    page_size: int = Query(25, ge=5, le=150)
 ):
     """
-    Lee on-chain: getTokenCount + páginas de getPaginatedTokensWithMetadata,
-    y por cada token consulta getTokenBondingStatus (y cong.)
+    Camino A: getPaginatedTokensWithMetadata (rápido).
+    Fallback: logs TokenCreated + getTokenMetadata + estados.
+    NUNCA levanta excepción → devuelve tokens:[] en error.
     """
-    w3, c = get_contract()
-    # total tokens
     try:
-        total = int(c.functions.getTokenCount().call())
+        w3, c = get_contract()
     except Exception as e:
-        return ok({"tokens": [], "count": 0, "error": f"getTokenCount: {e}"})
+        return _ok({"tokens": [], "count": 0, "error": str(e)})
 
     out: List[dict] = []
-    visited = 0
-    # iremos desde el final (recientes) hacia atrás por páginas
-    cursor = total
-    while cursor > 0 and len(out) < limit:
-        start = max(0, cursor - page_size)
-        try:
-            addrs, metas = c.functions.getPaginatedTokensWithMetadata(start, cursor - start).call()
-        except Exception as e:
-            return ok({"tokens": [], "count": 0, "error": f"getPaginatedTokensWithMetadata: {e}"})
-        visited += len(addrs)
+    # --------- Camino A ---------
+    try:
+        total = int(c.functions.getTokenCount().call())
+        cursor = total
+        while cursor > 0 and len(out) < limit:
+            start = max(0, cursor - page_size)
+            size = cursor - start
+            addrs, metas = c.functions.getPaginatedTokensWithMetadata(start, size).call()
+            for i in range(len(addrs)-1, -1, -1):
+                a = addrs[i]; m = metas[i]
+                try:
+                    _, isBonded, bts = c.functions.getTokenBondingStatus(a).call()
+                except Exception:
+                    isBonded, bts = False, 0
+                try:
+                    _, isFrozen, fts = c.functions.getTokenFrozenStatus(a).call()
+                except Exception:
+                    isFrozen, fts = False, 0
+                if not _want(bool(isBonded), bonded):
+                    continue
+                out.append({
+                    "address": a,
+                    "name": m[0], "symbol": m[1], "image": m[2],
+                    "creator": m[8],
+                    "creationTimestamp": int(m[9]) if str(m[9]).isdigit() else 0,
+                    "startingLiquidity": str(m[10]),
+                    "dexIndex": int(m[11]),
+                    "isBonded": bool(isBonded), "bondedTimestamp": int(bts) if str(bts).isdigit() else 0,
+                    "isFrozen": bool(isFrozen), "frozenTimestamp": int(fts) if str(fts).isdigit() else 0,
+                })
+                if len(out) >= limit:
+                    break
+            cursor = start
+        if out:
+            out.sort(key=lambda x: x.get("creationTimestamp", 0), reverse=True)
+            return _ok({"tokens": out[:limit], "count": len(out[:limit]), "pageInfo": {"mode": "page"}})
+    except Exception:
+        # seguimos al fallback
+        pass
 
-        # recorrer de más nuevo a más viejo dentro de la página
-        for i in range(len(addrs)-1, -1, -1):
-            addr = addrs[i]
-            meta = metas[i]
-            # meta: (name, symbol, image_uri, description, website, twitter, telegram, discord, creator, creationTimestamp, startingLiquidity, dexIndex)
+    # --------- Fallback (logs + metadata por token) ---------
+    try:
+        addrs = recent_from_logs(w3, c, limit=max(2*limit, 60))
+        for a in addrs:
             try:
-                _, isBonded, bondedTs = c.functions.getTokenBondingStatus(addr).call()
+                m = c.functions.getTokenMetadata(a).call()
+                try:
+                    _, isBonded, bts = c.functions.getTokenBondingStatus(a).call()
+                except Exception:
+                    isBonded, bts = False, 0
+                try:
+                    _, isFrozen, fts = c.functions.getTokenFrozenStatus(a).call()
+                except Exception:
+                    isFrozen, fts = False, 0
+                if not _want(bool(isBonded), bonded):
+                    continue
+                out.append({
+                    "address": a,
+                    "name": m[0], "symbol": m[1], "image": m[2],
+                    "creator": m[8],
+                    "creationTimestamp": int(m[9]) if str(m[9]).isdigit() else 0,
+                    "startingLiquidity": str(m[10]),
+                    "dexIndex": int(m[11]),
+                    "isBonded": bool(isBonded), "bondedTimestamp": int(bts) if str(bts).isdigit() else 0,
+                    "isFrozen": bool(isFrozen), "frozenTimestamp": int(fts) if str(fts).isdigit() else 0,
+                })
+                if len(out) >= limit:
+                    break
             except Exception:
-                isBonded, bondedTs = False, 0
-            try:
-                _, isFrozen, frozenTs = c.functions.getTokenFrozenStatus(addr).call()
-            except Exception:
-                isFrozen, frozenTs = False, 0
-
-            if not _bonded_match(bool(isBonded), bonded):
                 continue
-
-            item = {
-                "address": addr,
-                "name": meta[0],
-                "symbol": meta[1],
-                "image": meta[2],
-                "creator": meta[8],
-                "creationTimestamp": int(meta[9]) if str(meta[9]).isdigit() else 0,
-                "startingLiquidity": str(meta[10]),
-                "dexIndex": int(meta[11]),
-                "isBonded": bool(isBonded),
-                "bondedTimestamp": int(bondedTs) if str(bondedTs).isdigit() else 0,
-                "isFrozen": bool(isFrozen),
-                "frozenTimestamp": int(frozenTs) if str(frozenTs).isdigit() else 0,
-            }
-            out.append(item)
-            if len(out) >= limit:
-                break
-
-        cursor = start
-
-    # Orden final (más nuevos primero)
-    out.sort(key=lambda x: x.get("creationTimestamp", 0), reverse=True)
-    return ok({ "tokens": out, "count": len(out), "pageInfo": {"total": total, "visited": visited} })
+        out.sort(key=lambda x: x.get("creationTimestamp", 0), reverse=True)
+        return _ok({"tokens": out[:limit], "count": len(out[:limit]), "pageInfo": {"mode": "logs"}})
+    except Exception as e:
+        return _ok({"tokens": [], "count": 0, "error": str(e)})
 
 @router.get("/liqd/recent_unbonded_chain")
-async def recent_unbonded_chain(limit: int = Query(30, ge=1, le=200), page_size: int = Query(100, ge=10, le=300)):
-    # azúcar sintáctico
-    resp = await recent_launch(limit=limit, bonded="unbonded", page_size=page_size)
-    return resp
+async def recent_unbonded_chain(limit: int = Query(30, ge=1, le=200), page_size: int = Query(25, ge=5, le=150)):
+    return await recent_launch(limit=limit, bonded="unbonded", page_size=page_size)
 
 @router.get("/liqd/recent_frozen")
-async def recent_frozen(limit: int = Query(24, ge=1, le=200), page_size: int = Query(100, ge=10, le=300)):
-    w3, c = get_contract()
+async def recent_frozen(limit: int = Query(24, ge=1, le=200)):
     try:
-        total = int(c.functions.getTokenCount().call())
+        w3, c = get_contract()
     except Exception as e:
-        return ok({"tokens": [], "count": 0, "error": f"getTokenCount: {e}"})
-
+        return _ok({"tokens": [], "count": 0, "error": str(e)})
     out: List[dict] = []
-    cursor = total
-    while cursor > 0 and len(out) < limit:
-        start = max(0, cursor - page_size)
+    addrs = recent_from_logs(w3, c, limit=200)
+    for a in addrs:
         try:
-            addrs, metas = c.functions.getPaginatedTokensWithMetadata(start, cursor - start).call()
-        except Exception as e:
-            return ok({"tokens": [], "count": 0, "error": f"getPaginatedTokensWithMetadata: {e}"})
-        for i in range(len(addrs)-1, -1, -1):
-            addr = addrs[i]
-            meta = metas[i]
-            try:
-                _, isFrozen, frozenTs = c.functions.getTokenFrozenStatus(addr).call()
-            except Exception:
-                isFrozen, frozenTs = False, 0
-            if not isFrozen:
+            _, frozen, fts = c.functions.getTokenFrozenStatus(a).call()
+            if not frozen:
                 continue
+            m = c.functions.getTokenMetadata(a).call()
             out.append({
-                "address": addr,
-                "name": meta[0],
-                "symbol": meta[1],
-                "creationTimestamp": int(meta[9]) if str(meta[9]).isdigit() else 0,
-                "isFrozen": True,
-                "frozenTimestamp": int(frozenTs) if str(frozenTs).isdigit() else 0,
+                "address": a,
+                "name": m[0], "symbol": m[1], "image": m[2],
+                "creationTimestamp": int(m[9]) if str(m[9]).isdigit() else 0,
+                "isFrozen": True, "frozenTimestamp": int(fts) if str(fts).isdigit() else 0
             })
             if len(out) >= limit:
                 break
-        cursor = start
-
+        except Exception:
+            continue
     out.sort(key=lambda x: x.get("frozenTimestamp", 0), reverse=True)
-    return ok({ "tokens": out, "count": len(out) })
+    return _ok({"tokens": out, "count": len(out)})
 
+# Alias de compatibilidad con tu front:
 @router.get("/liqd/recent_tokens_rpc")
 async def recent_tokens_rpc(
     limit: int = Query(30, ge=1, le=200),
-    bonded: Literal["unbonded", "bonded", "both"] = Query("both"),
-    page_size: int = Query(100, ge=10, le=300)
+    bonded: Literal["unbonded","bonded","both"] = Query("both"),
+    page_size: int = Query(25, ge=5, le=150)
 ):
-    # por compatibilidad con tu front, delega a recent_launch
     return await recent_launch(limit=limit, bonded=bonded, page_size=page_size)
