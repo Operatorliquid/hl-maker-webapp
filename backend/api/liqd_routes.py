@@ -9,10 +9,26 @@ from .rpc_util import get_contract, created_ms  # usa tu util existente
 
 router = APIRouter()
 
-# Opcional: relay para LIQD (Cloudflare Worker / Vercel)
-LIQD_WORKER_URL = (os.getenv("LIQD_WORKER_URL") or "").strip()  # ej: https://tu-worker.workers.dev
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+def _worker_base() -> str:
+    """
+    Normaliza LIQD_WORKER_URL:
+      - agrega https:// si falta
+      - quita barra final
+    """
+    u = (os.getenv("LIQD_WORKER_URL") or "").strip()
+    if not u:
+        return ""
+    if not (u.startswith("http://") or u.startswith("https://")):
+        u = "https://" + u
+    return u.rstrip("/")
 
 
+# ------------------------------------------------------------
+# Token list (LIQD) con proxy opcional al worker
+# ------------------------------------------------------------
 @router.get("/liqd/recent_proxy")
 def liqd_recent_proxy(
     limit: int = Query(24, ge=1, le=200),
@@ -28,8 +44,9 @@ def liqd_recent_proxy(
         params["search"] = search
 
     urls = []
-    if LIQD_WORKER_URL:
-        urls.append(LIQD_WORKER_URL)        # relay (si tenés CF Worker/Vercel)
+    wb = _worker_base()
+    if wb:
+        urls.append(wb)  # relay (Cloudflare Worker / Vercel)
     urls.append("https://api.liqd.ag/tokens")  # directo
 
     last_err = "unknown"
@@ -62,6 +79,9 @@ def liqd_recent_proxy(
     return JSONResponse({"tokens": [], "error": last_err}, status_code=200)
 
 
+# ------------------------------------------------------------
+# On-chain puro: unbonded (recorre páginas hacia atrás)
+# ------------------------------------------------------------
 @router.get("/liqd/recent_unbonded_chain")
 def liqd_recent_unbonded_chain(
     limit: int = Query(24, ge=1, le=200),
@@ -77,7 +97,6 @@ def liqd_recent_unbonded_chain(
     try:
         w3, c = get_contract()
     except Exception as e:
-        # get_contract ya puede lanzar HTTPException; normalizamos a JSON 200
         from fastapi import HTTPException
         if isinstance(e, HTTPException):
             return JSONResponse({"tokens": [], "count": 0, "error": e.detail}, status_code=200)
@@ -99,7 +118,6 @@ def liqd_recent_unbonded_chain(
         except Exception:
             break
 
-        # iteramos del más nuevo al más viejo dentro del bloque
         for i in reversed(range(len(addrs))):
             addr = addrs[i]
             meta = metas[i]
@@ -120,12 +138,15 @@ def liqd_recent_unbonded_chain(
             if remaining <= 0:
                 break
 
-        total = start  # pasamos al bloque anterior
+        total = start  # paso al bloque anterior
 
     out.sort(key=created_ms, reverse=True)
     return JSONResponse({"tokens": out, "count": len(out)}, status_code=200)
 
 
+# ------------------------------------------------------------
+# Semilla LIQD + verificación on-chain (unbonded)
+# ------------------------------------------------------------
 @router.get("/liqd/recent_unbonded")
 def liqd_recent_unbonded(limit: int = Query(24, ge=1, le=200)):
     """
@@ -136,7 +157,7 @@ def liqd_recent_unbonded(limit: int = Query(24, ge=1, le=200)):
     """
     # 1) Semilla
     seeds: List[dict] = []
-    for u in filter(None, [LIQD_WORKER_URL, "https://api.liqd.ag/tokens"]):
+    for u in filter(None, [_worker_base(), "https://api.liqd.ag/tokens"]):
         try:
             with httpx.Client(timeout=8.0) as client:
                 r = client.get(u, params={"limit": str(limit * 5), "metadata": "true"})
@@ -180,13 +201,11 @@ def liqd_recent_unbonded(limit: int = Query(24, ge=1, le=200)):
         except Exception:
             a = addr
 
-        # Confirmar contrato del Launch
         try:
             meta = c.functions.getTokenMetadata(a).call()
         except Exception:
             continue
 
-        # Unbonded
         try:
             _ta, isBonded, _bt = c.functions.getTokenBondingStatus(a).call()
             if isBonded:
@@ -207,6 +226,9 @@ def liqd_recent_unbonded(limit: int = Query(24, ge=1, le=200)):
     return JSONResponse({"tokens": out, "count": len(out)}, status_code=200)
 
 
+# ------------------------------------------------------------
+# Frozen (isFrozen=true)
+# ------------------------------------------------------------
 @router.get("/liqd/recent_frozen")
 def liqd_recent_frozen(
     limit: int = Query(24, ge=1, le=200),
@@ -266,6 +288,9 @@ def liqd_recent_frozen(
     return JSONResponse({"tokens": out, "count": len(out)}, status_code=200)
 
 
+# ------------------------------------------------------------
+# RPC health
+# ------------------------------------------------------------
 @router.get("/liqd/rpc_health")
 def liqd_rpc_health():
     """
@@ -296,6 +321,9 @@ def liqd_rpc_health():
     return {"ok": any_ok, "rpcs": results}
 
 
+# ------------------------------------------------------------
+# Última página por RPC local (bonded/unbonded/both)
+# ------------------------------------------------------------
 @router.get("/liqd/recent_tokens_rpc")
 def liqd_recent_tokens_rpc(
     limit: int = Query(30, ge=1, le=200),
@@ -376,71 +404,32 @@ def liqd_recent_tokens_rpc(
     }, status_code=200)
 
 
-@router.get("/liqd/_ll_debug")
-def liqd_ll_debug(page_size: int = 50):
-    """
-    Debug del contrato LiquidLaunch:
-      - chainId y blockNumber
-      - getTokenCount()
-      - muestra hasta page_size últimas direcciones + bondedStatus (no filtra)
-    """
+# ------------------------------------------------------------
+# Debug rápido del Worker
+# ------------------------------------------------------------
+@router.get("/liqd/worker_debug")
+def liqd_worker_debug():
+    base = _worker_base()
+    if not base:
+        return {"ok": False, "error": "worker_not_configured"}
+    url = base + "/recent-tokens-rpc"
     try:
-        w3, c = get_contract()
+        with httpx.Client(timeout=8.0) as client:
+            r = client.get(url, params={"limit": "3", "bonded": "both"})
+            return {
+                "ok": r.status_code == 200,
+                "status": r.status_code,
+                "url": str(r.request.url),
+                "content_type": r.headers.get("content-type"),
+                "preview": r.text[:300]
+            }
     except Exception as e:
-        from fastapi import HTTPException
-        if isinstance(e, HTTPException):
-            return {"ok": False, "error": e.detail}
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "url": url, "error": str(e)}
 
-    info = {"ok": True, "rpc": str(w3.provider.endpoint_uri)}
-    try:
-        info["chainId"] = int(w3.eth.chain_id)
-    except Exception as e:
-        info["chainId_error"] = str(e)
-    try:
-        info["blockNumber"] = int(w3.eth.block_number)
-    except Exception as e:
-        info["blockNumber_error"] = str(e)
 
-    try:
-        total = int(c.functions.getTokenCount().call())
-        info["tokenCount"] = total
-    except Exception as e:
-        info["tokenCount_error"] = str(e)
-        return info
-
-    if total <= 0:
-        info["sample"] = []
-        return info
-
-    start = max(0, total - page_size)
-    size  = total - start
-    sample = []
-    try:
-        addrs, metas = c.functions.getPaginatedTokensWithMetadata(start, size).call()
-        for i in reversed(range(len(addrs))):
-            a = addrs[i]
-            try:
-                _a, isBonded, ts = c.functions.getTokenBondingStatus(a).call()
-            except Exception:
-                isBonded, ts = None, None
-            m = metas[i]
-            sample.append({
-                "address": a,
-                "name": m[0],
-                "symbol": m[1],
-                "creationTimestamp": int(m[9]) if str(m[9]).isdigit() else m[9],
-                "isBonded": isBonded,
-                "bondedTimestamp": int(ts) if (ts is not None and str(ts).isdigit()) else ts,
-            })
-    except Exception as e:
-        info["sample_error"] = str(e)
-        sample = []
-
-    info["sample_size"] = len(sample)
-    info["sample"] = sample[: min(len(sample), 10)]
-    return info
-
+# ------------------------------------------------------------
+# Worker proxy: recent tokens
+# ------------------------------------------------------------
 @router.get("/liqd/recent_tokens_worker")
 def liqd_recent_tokens_worker(
     limit: int = Query(30, ge=1, le=200),
@@ -450,10 +439,11 @@ def liqd_recent_tokens_worker(
     Proxy al Cloudflare Worker: /recent-tokens-rpc
     Devuelve tal cual lo que responda el worker (status 200 siempre).
     """
-    if not LIQD_WORKER_URL:
+    base = _worker_base()
+    if not base:
         return JSONResponse({"tokens": [], "count": 0, "error": "worker_not_configured"}, status_code=200)
 
-    url = LIQD_WORKER_URL.rstrip("/") + "/recent-tokens-rpc"
+    url = base + "/recent-tokens-rpc"
     params = {"limit": str(limit), "bonded": bonded}
     try:
         with httpx.Client(timeout=8.0) as client:
@@ -461,10 +451,14 @@ def liqd_recent_tokens_worker(
             if r.status_code != 200:
                 return JSONResponse({"tokens": [], "count": 0, "error": f"worker_{r.status_code}"}, status_code=200)
             data = r.json()
-            # Normalizamos a la forma estándar si hiciera falta:
+            # Normaliza posibles formas
             if isinstance(data, dict) and "tokens" in data:
+                if "count" not in data:
+                    try:
+                        data["count"] = len(data.get("tokens") or [])
+                    except Exception:
+                        data["count"] = 0
                 return JSONResponse(data, status_code=200)
-            # Si el worker devuelve array directo:
             if isinstance(data, list):
                 return JSONResponse({"tokens": data, "count": len(data)}, status_code=200)
             return JSONResponse({"tokens": [], "count": 0, "error": "worker_bad_shape"}, status_code=200)
